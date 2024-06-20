@@ -1,20 +1,23 @@
-### DESeq2 RNA Seq Analysis Script for multiple factors / treatments
+########################################################################
+### DESeq2 RNA Seq Analysis Script for multiple factors / treatments ###
+########################################################################
+
 # Author: Hannes Reinwald
 # Contact: hannes.reinwald@ime.fraunhofer.de
 
-# README #####
+### README ### -----------------------------------------------------------
 # This script is desgined to run DESeq2 normalization and statistical testing on RNAseq experiments
-# in Ecotox testing with multiple concentrations. This script will automatically adopt to the k numbers
-# of samples and N numbers of conditions (High,Mid,Low or Treat1, Treat2, Treat3, ... , Control) and will 
-# generate Log2FC values with respect to control groups.
+# in Ecotox testing for multiple concentrations. This script will automatically adopt to the k numbers
+# of samples and N numbers of conditions (High,Mid,Low or Treat1, Treat2, Treat3, ... , Control) and 
+# will generate Log2FC values with respect to control groups.
 
 # Requiered Input: 
-# - CountMatrix.csv
+# - CountMatrix (txt or csv is fine, if csv read.csv2 is used)
 # - coldata.csv
 
 # Main Analysis Steps are: 
 # 1) RLE normalization (DESeq2) across all samples element of CountMatrix
-# 2) Calc LFC (with respect to control) and LFcutOff (upper 90% quantile of abs(LFC values))
+# 2) Calc LFC (with respect to control) and LFcutOff (upper 75% quantile of abs(LFC values))
 # 3) apeglm shrinking on LFC
 
 # 4) Multiple t-testing with Benjamin-Hochberg correction (padj < 0.05) 
@@ -39,1853 +42,1164 @@
 # 6.2 DEGs (padj < 0.05 and LFcut for: 
 #     - N-1 files for LFC
 #     - N-1 files for apeglm(LFC)
-############
+##############
 
-### LOAD PACKAGES ####
+### LOAD PACKAGES ### -------------------------------------------------
 require(DESeq2) #installed
 require(IHW)    #installed
 require(apeglm) #installed
-#require(ashr)  #not needed yet .. failed to install though ... 
 require(qvalue)
-require(locfdr)
+#require(locfdr)
+#require(RColorBrewer)
 require(ggplot2)
 require(ggpubr)
 require(hexbin)
+#####################
 
-# Install the following if needed
-#BiocManager::install("DESeq2")
-#BiocManager::install("IHW")
-#BiocManager::install("apeglm")
-#BiocManager::install("qvalue")
-#BiocManager::install("vsn")
-#BiocManager::install("EnhancedVolcano")
-####################
+### DATA IMPORT & Color settings ### ---------------------------------------------------
+message("\nImporting CountMatrix and coldata files ...")
 
-### DATA IMPORT ####
-# coldata import
-coldata <- read.csv2("coldata.csv", header = TRUE, row.names = 1)
-cols <- which(variable.names(coldata) != "X.1" & variable.names(coldata) != "X.2" & variable.names(coldata) != "X.3")
-rows <- which(coldata$Condition != "") #this section is needed to avoid messed up data imports from xcel
-coldata <- droplevels(coldata[rows,cols]) #clean levels of coldata file! 
-rm(rows,cols)
-
-coldata$SampleID <- row.names(coldata) #in case row names get lost down the line
-
-substance <- levels(as.factor(coldata$Substance)) #Extract the name(s) of the tested substance(s)
-condition <- levels(as.factor(coldata$Condition))
-
-# CountMatrix import
-count.matrix <- read.csv2(file = "CountMatrix.csv", header = T, row.names = 1, fill = F)
-# subset cols in count.matrix after rows in coldata. So there is only the need to trim the coldata file manually
-count.matrix <- subset(count.matrix, select=row.names(coldata))
-
-# Extract Condition IDs
-for (i in condition){
-  x <- row.names(coldata[which(coldata$Condition %in% i),])
-  assign(paste0("ID.",i),x)
-  rm(i,x)
-}
-
-# Sort & check correct data import:
-count.matrix <- count.matrix[,rownames(coldata)] #match() function could be propably used as well ...
-stopifnot(all(rownames(coldata) == colnames(count.matrix))) #Must be TRUE
-###################
-
-### CREATE AND NAVIGATE TO OUTPUT FOLDERS ####
-# Output folder
-out <- "DESeq2_Pairwise"
-dir.create(out)
-setwd(paste0("./",out))
-for (i in c("DEGs","Plots","Results")){
-  dir.create(i)
-}
-for (i in c("DataQC","Heatmaps")){
-  dir.create(paste0("Plots/",i))
-}
-rm(i,out)
-############################################
-
-### CREATE DESeq2 OBJECT #####
-p <- 0.05 # padj cutoff
-
-message(paste0(" 
- Starting DESeq2 Analysis - Pairwise Wald's t-test...
- padj < ",p,"
- Tested Substance: ",substance,"
-               "))
-
-# Import entire count matrix into a DESeq2 Object
-dds <- DESeqDataSetFromMatrix(countData = count.matrix,
-                              colData = coldata,
-                              design = ~ Tank + Condition) #Multifactor Level
-# log2 fold change and Wald test p value will be computed for the LAST variable in the design formula!
-
-# Filter Matrix
-#keep <- counts(dds)[apply(count.matrix[c(1:9)],1,function(z) !any(z==0)),] #Remove all Genes with a 0 value in their row
-keep <- counts(dds)[rowSums(count.matrix) >= length(colnames(count.matrix)), ] 
-# length(row.names(keep))  # use this line to check how many genes still remain in your dataset 
-
-# create vector list of removed genes 
-x <- row.names(count.matrix)
-y <- row.names(keep)
-rmv <- setdiff(x,y) # Names of removed genes
-rm(x,y)
-
-### NEW, filtered dds object ###
-dds <- dds[row.names(keep),]
-rm(keep)
-
-# Set factor levels in right order:
-# for more details check the DESeq2 Vignette on "Note on factor levels"
-if (all(grepl("Exposure",condition[2:4]))==T & length(condition)==4){
-  # use this line when dealing with: High, Mid and Low Exposure condition
-  print("Sorting 3 Treatments (Low, Mid & High Exposure) and setting Control as reference level.")
-  dds$Condition <- factor(dds$Condition, levels = c(condition[1],  # Control
-                                                    condition[3],  # LExp
-                                                    condition[4],  # MExp
-                                                    condition[2])) # HExp
-} else if (all(grepl("Exposure",condition[2:3]))==T & length(condition)==3) {
-  # use this line when dealing with: High, Mid and Low Exposure condition
-  print("Sorting 2 Treatments (Low & High Exposure) and setting Control as reference level.")
-  dds$Condition <- factor(dds$Condition, levels = c(condition[1],  # Control
-                                                    condition[3],  # LExp
-                                                    condition[2])) # HExp
+## coldata import ##
+tmp = list.files(full.names = T, pattern = "[Cc]oldata[.]")
+if(grepl(".csv",tmp)==T){
+  coldata = read.csv2(file = tmp, row.names = 1, header = T)
+  # In case csv file was not differently exported run read.csv
+  if (ncol(coldata) <= 1) {
+    coldata = read.csv(file = tmp, row.names = 1, header = T)
+  }
 } else {
-  # or just specifying the reference level (usually control)
-  print( "Set Control to reference level for multiple treatments.")
-  #dds$Condition <- factor(dds$Condition, ordered = FALSE )
-  dds$Condition <- relevel(dds$Condition, ref = "Control")
+  # if not ending with csv import with read.delim2
+  coldata = read.delim2(file = tmp, row.names = 1, header = T)
+  if (ncol(coldata) <= 1) {
+    # if file was differently formated use read.delim
+    coldata = read.delim(file = tmp, row.names = 1, header = T)
+  }
 }
-# Set levels for coldata
-coldata$Condition <- factor(coldata$Condition, levels = levels(dds$Condition))
+coldata <- droplevels(coldata[which(coldata$Condition != ""), # filtering for non empty rows
+                              which(!(grepl("X.",colnames(coldata))) == T)]) # filtering cols
+coldata$Condition <- gsub(" ","",coldata$Condition) #removing any spaces in Condition levels
+coldata$Tank <- gsub("-","_",coldata$Tank)
+
+# set factor levels
+coldata$Tank      <- factor(coldata$Tank)
+coldata$Condition <- factor(coldata$Condition)
+coldata$Substance <- factor(coldata$Substance)
+substance         <- levels(coldata$Substance) #Extract the name(s) of the tested substance(s)
+
+# relevel factors in Condition in right order:
+condition = levels(coldata$Condition)
+tmp = as.character(coldata$Condition[grep("[Cc]ontrol",coldata$Condition)][1]) #extract control factor level
+if(all(grepl("[Ee]xposure",condition[2:4]))==T & length(condition)==4) {# Control, LE, ME, HE
+  coldata$Condition <- factor(coldata$Condition, levels = condition[c(1,3,4,2)])
+} else if (all(grepl("[Ee]xposure",condition[2:3]))==T & length(condition)==3) { # Control, LE, HE
+  coldata$Condition <- factor(coldata$Condition, levels = condition[c(1,3,2)])
+} else { # just specifying the reference level --> Control
+  coldata$Condition <- relevel(coldata$Condition, ref = tmp)
+}
+message(paste0("Reference level:\t",levels(coldata$Condition)[1]),"\nSorting ",length(condition)-1," Treatments:\t",paste(levels(coldata$Condition)[-1], collapse = " "))
+condition <- levels(coldata$Condition)
+
+## CountMatrix import ##
+# Import all provided count mtx files and merge them together;
+# then filter according to the provided sample ID in coldata
+importCountMtx = function(file){
+  if(any(grepl(".txt",file))==T) { # import txt
+    tmp1 = file[grepl(".txt",file)]
+    count.matrix = read.table(file = tmp1, row.names = 1, header = T)
+    if(ncol(count.matrix) <= 1) {
+      count.matrix = read.delim2(file = tmp1, row.names = 1, header = T)
+      if(ncol(count.matrix) <= 1) {
+        count.matrix = read.delim(file = tmp1, row.names = 1, header = T)
+      }
+    }
+  } else { # import csv
+    tmp1 = file[grepl(".csv",file)]
+    count.matrix = read.csv2(tmp1, header = T, row.names = 1, fill = F)
+    if(ncol(count.matrix) <= 1) {
+      count.matrix = read.csv(tmp1, header = T, row.names = 1, fill = F)
+    }
+  }
+  return(count.matrix)
+}
+countMtxMerge = function(cmtx.ls){
+  mergeMtx = function(df1,df2){merge(df1,df2, by=0, all = T)}
+  mtx = Reduce(mergeMtx, cmtx.ls)
+  row.names(mtx) <- mtx$Row.names
+  return(mtx[,-1])
+}
+
+cmtx.ls = list()
+tmp = list.files(full.names = F, pattern = "[Cc]ount[Mm]atrix")
+for(i in tmp){ cmtx.ls[[sub("[Cc]ount[Mm]atrix","",i)]] <- importCountMtx(i) }
+if(length(cmtx.ls) == 1){
+  count.matrix = cmtx.ls[[1]]
+} else {
+  count.matrix <- countMtxMerge(cmtx.ls)
+}
+
+# subset cols in count.matrix after rows in coldata. So there is only the need to trim the coldata file manually
+count.matrix <- count.matrix[,rownames(coldata)] 
+if(all(sort(row.names(coldata)) == sort(colnames(count.matrix))) == F) {
+  stop("\nCount matrix colnames and coldata rownames do not match up!\nPlease check your input files!")
+}
+stopifnot(all(rownames(coldata) == colnames(count.matrix))) # Must be TRUE!
+message("Done!\n")
+rm(i,tmp, cmtx.ls)
+
+### Set annotation colors for downstream plotting ###
+col.Cond = colorRampPalette(RColorBrewer::brewer.pal(n=8, name="YlOrRd"))(length(levels(coldata$Condition)))
+col.Cond[1] <- "#56B4E9" #Defines color for control
+col.Tank = colorRampPalette(c("gray95","gray50"))(length(levels(coldata$Tank)))
+ann_colors = list(Tank = setNames(col.Tank, levels(coldata$Tank)),
+                  Condition = setNames(col.Cond, levels(coldata$Condition)))
+####################################
+
+### Setup output environment ###
+dir.create("DESeq2_Pairwise", showWarnings = F)
+setwd("DESeq2_Pairwise")
+home = getwd()
+
+
+##################
+###   DESeq2   ###
+##################
+
+## Count Matrix filtering -----------------------------------------------------
+message(paste0("\nRemoving low abundant counts from count matrix.",
+               "\nMinimum number of gene counts per row: \t\t",ncol(count.matrix)))
+
+## Create condition groups ID list
+id.ls = list()
+for(i in condition) {id.ls[[i]] = rownames(coldata[coldata$Condition %in% i,])}
+stopifnot(length(id.ls) > 1) # Stop script here if there is only one condition provided
+# We will need this object later ... 
+
+## NEW - Threshold criteria ----------------------------------------
+# We will use the CPM filtering threshold ("relevance threshold") suggested by Verheijen et al 2022.
+# excludes all genes that do not have at least 65% of their replicates expressed at 1 CPM in
+# atleast one of the experimental conditions. This will remove low abundant gene counts prior DESeq2
+# DGEA which can speed up things
+
+## CPM transformation function #
+my_CPM = function(mtx){
+  SF = apply(mtx,2,sum)/10^6 #Scaling factors
+  cpm = mtx
+  for(i in names(SF)){
+    cpm[,i] <- mtx[,i] / SF[i]
+  }
+  return(cpm)
+}
+#CPM.matrix = my_CPM(count.matrix)
+#boxplot(log10(CPM.matrix+1))
+#barplot(apply(CPM.matrix,2,sum))
+
+## relevance filter function #
+filterCPMs = function(CPM.matrix, id.ls, minCPM=1, perc=.65){
+  # subset mtx for each exp. condition 
+  cond = lapply(id.ls, function(x){ CPM.matrix[,x] })
+  # check if a certain percantage (perc.) of CPMs is > minCPM
+  cond = lapply(cond, function(x){
+    X = apply(x, 1, function(i){
+      # Count the values > minCPM in i and divide by the length of i
+      Z = length(which((i >= minCPM) == T)) / length(i)
+      # If Z >= the min percentage criteria return T else F
+      if(Z >= perc){ TRUE } else { FALSE }
+    })
+    names(X) <- row.names(x)
+    return(X)
+  })
+  # Combine all in a df
+  cond = as.data.frame(rlist::list.cbind(cond))
+  
+  # retrieve only GeneIDs for which atleast one condition with all (65%) replicates >1 CPM
+  keep = names(which(apply(cond,1, function(x){ any(x == T) }) == T))
+  
+  n=round((length(keep) / nrow(CPM.matrix))*100,2)
+  message(length(keep)," out of ",nrow(CPM.matrix)," gene IDs met the relevance criteria.\n",
+          n,"% of initial gene IDs were kept for downstream processing.")
+  return(CPM.matrix[keep,])
+}
+
+## relevance filter function for raw count matrix table #
+# (performs CPM transformation and subsequently filtering and returns 
+# non-transformed but filtered count mtx)
+relevance.filter = function(mtx, id.ls, ...){
+  keep = row.names(filterCPMs(my_CPM(mtx), id.ls=id.ls, ...))
+  return(mtx[keep,])
+}
+
+## Filter input matrix 
+minCPM <- 1 # Minimum counts per million in some samples
+perc <- 0.65 # Percent of samples in ONE condition which need a cpm > minCPM - 0.65 equals 3/3 samples!
+
+count.matrix.cl = relevance.filter(count.matrix, id.ls, minCPM, perc)
+
+## The following lines can be used to check your count distr
+#hist(as.matrix(log10(count.matrix+1)), breaks = 100, ylim = c(0,5000))
+#hist(as.matrix(log10(count.matrix.cl+1)), breaks = 100, ylim = c(0,5000))
+#hist(as.matrix(count.matrix.cl), breaks = 100, ylim = c(0,500))
+
+## Create DESeq2 object -------------------------------------------------------
+p  = 0.05 # padj cutoff
+Qt = 0.75  # %-Quantile for effect size cut off (i.e. 0.9 => 90% = top 10% abs(LFC))
+message(paste0("\n Starting DESeq2 Analysis - Pairwise Wald's t-test and IHW \n padj < ",p,"\n Tested Substance: \t",substance,"\n"))
+
+# Check if we have a balanced test design.
+t1 = all(table(coldata$Condition) == table(coldata$Condition)[1])
+t2 = all(table(coldata$Tank) == table(coldata$Tank)[1])
+t3 = length(unique(coldata$Tank)) #to check if there are more than one tank condition.
+if(all(c(t1,t2) == T) & t3 > 1){
+  # if TRUE we have a balanced test design between Conditions and Tanks.
+  # Hence we can apply a multifactor model as: ~ Tank + Condition
+  message("Test design of experiment is BALANCED.\nApplying multi-factor model:\t~ Tank + Condition")
+  dds <- DESeqDataSetFromMatrix(countData = count.matrix.cl, colData = coldata,
+                                design = ~ Tank + Condition) 
+  # Multifactor model controlling for variability in Tanks
+} else {
+  # if FALSE test design is not balanced and we can not directly apply the batch effect correction here.
+  # Hence the model design in this case is only ~ Tank
+  message("Test design of experiment is NOT BALANCED.\nApplying uni-factor model:\t~ Condition")
+  dds <- DESeqDataSetFromMatrix(countData = count.matrix.cl, colData = coldata,
+                                design = ~ Condition)
+}
+rm(t1,t2,t3)
+
 
 # Get a list of different disp estimates for later QC plotting
-fitType = c("parametric", "local", "mean")
+fitType = c("parametric", "local") #additonally "mean" possible
 estDisp.ls <- list()
 for(i in fitType){
+  message(paste("\nEstimate Dispersions for fitType: ",i))
   x <- estimateSizeFactors(dds)
   x <- estimateDispersions(x, fitType = i)
   estDisp.ls[[i]] <- x
 }
+rm(x,i,fitType)
+
+## RUN DESeq() ----------------------------------------------------------------
+message("\nRunning DESeq2 pairwise comparison ...")
+dds <- DESeq(dds, test = "Wald")                   # Pairwise comparison
+#dds <- DESeq(dds, test = "LRT", reduced = ~ Tank) # ANOVA-like approach
+
+## Extract norm. & transformed count.matrix ------------------------------------
+normMtx =list()
+normMtx[["norm"]]   = round(counts(dds, normalized = T),3) # [[1]]  normalized read counts
+normMtx[["ntd"]]    = round(assay(normTransform(dds)),3)   # [[2]] (n+1)log2 transformed norm counts
+normMtx[["nrl"]]    = round(assay(rlog(dds, blind = F)),3) # [[3]] rlog transformed mean read counts
+normMtx[["nrl.bl"]] = round(assay(rlog(dds, blind = T)),3) # [[4]] rlog transformed mean read counts; BLIND!
+
+message("\nExporting DESeq2 normalized count matrix. This might take a while...\nSaving to txt table ...")
+write.table(normMtx[[1]], paste0(substance,"_DESeqNormCounts.txt")) # Extract DESEq2 normalized count matrix
+#write.table(df.rld, paste0(substance,"_rlogDESeqNormCounts.txt")) # Extract rlog(norm counts) matrix
+message("Done!\n")
+
+## Extract DESeq2 result tables to list objects --------------------------------
+resNames = resultsNames(dds)[grepl("^[Cc]ondition_",resultsNames(dds))]
+## Non-shrunk results
+res.ls <- list() #create an empty list to store objects in
+for(i in resNames) {
+  x = gsub("[Cc]ondition_","", i)
+  message(paste0("Extracting DESeq2 results for: ",x," [IHW, non-shrunk Log2FC] ..."))
+  res.ls[[gsub("_.+","",x)]] <- results(dds, name = i, filterFun = ihw, alpha = p)
+  message("Done!\n")
+}
+## apeglm shunk results
+resLfs.ls <- list() # save log2FC shrunk results in different list
+for(i in resNames) {
+  x = gsub("[cC]ondition_","", i)
+  message(paste0("Extracting DESeq2 results for: ",x," [IHW, apeglm shrunk Log2FC] ..."))
+  resLfs.ls[[gsub("_.+","",x)]] <- lfcShrink(dds, coef = i, type = "apeglm", 
+                                             res = res.ls[[gsub("_.+","",x)]])
+  message("Done!\n")
+}
 rm(x,i)
 
-# FINALLY RUN DESeq function ----
-dds <- DESeq(dds, test = "Wald") # Use only for pairwise comparison
-# LRT might be better suited for multiple factor analysis
-#dds <- DESeq(dds, test = "LRT", reduced = ~ Tank) #ANOVA-like approach
-
-### DESeq2 counts and Objects ###
-# Extract normalized read counts
-df.counts <- counts(dds, normalized = T)
-
-# Extract (n+1)log2 transformed mean read counts
-ntd <- normTransform(dds)
-df.ntd <- assay(ntd)
-
-# Extract rlog transformed mean read counts
-rld <- rlog(dds, blind = FALSE)
-df.rld <- assay(rld)
-###########################
-
-### EXTRACT DESeq2 RESULTS ####
-message(" Exporting DESeq normalized count matrix. This might take a while...
- Saving to tab delim txt ...")
-# Extract DESEq2 normalized count matrix
-write.table(as.data.frame(df.counts), paste0(substance,"_DESeqNormCounts.txt"))
-# Extract rlog(norm counts) matrix
-write.table(as.data.frame(df.rld), paste0(substance,"_rlogDESeqNormCounts.txt"))
-
-# non shrunk
-for (i in resultsNames(dds)[grepl("^Condition_",resultsNames(dds))]){
-  x <- gsub("Condition_","", i)
-  print(paste0("Extracting DESeq2 results for: ",x," [IHW, non-shrunk LFC]"))
-  x <- gsub("_vs_Control","",x)
-  x <- gsub("Exposure","",x)
-  y <- results(dds, 
-               name = i, 
-               filterFun = ihw)
-  assign(paste0("res.",x),y)
-  rm(x,y,i)
-}
-# Same for reslfs (apeglm shrunk)
-for (i in resultsNames(dds)[grepl("^Condition_",resultsNames(dds))]){
-  x <- gsub("Condition_","", i)
-  print(paste0("Extracting DESeq2 results for: ",x," [IHW, apeglm(LFC) shrunk]"))
-  x <- gsub("_vs_Control","",x)
-  x <- gsub("Exposure","",x)
-  y <- lfcShrink(dds, 
-                 coef = i,
-                 type = "apeglm",
-                 res = get(paste0("res.",x))
-                 )
-  assign(paste0("reslfs.",x),y)
-  rm(x,y,i)
-}
-
-# Extract res. variable strings as resNames for loop functions
-x <- resultsNames(dds)[grepl("^Condition_",resultsNames(dds))]
-x <- gsub("Condition_","", x) # rmv Condition_ string
-x <- gsub("_vs_Control","",x) # rmv _vs_Control string
-resNames <- gsub("Exposure","",x) #rmv Exposure string
-#############################
-
-### Log2FC Cutoff SETTING ####
-# via quantile calc:
-# qunatile() can use 9 different methods for calculating the quantiles.
-# Further details are provided in Hyndman and Fan (1996) who recommended type 8. 
-# The default method is type 7, as used by S and by R < 2.0.0.
-#
-# Type 7:
-# m = 1-p. p[k] = (k - 1) / (n - 1). In this case, p[k] = mode[F(x[k])]. This is used by S
-#
-# Type 8:
-# m = (p+1)/3. p[k] = (k - 1/3) / (n + 1/3). Then p[k] =~ median[F(x[k])]. 
-# The resulting quantile estimates are approximately median-unbiased regardless of the distribution of x.
-##########################
-# Only extracted from NON SHRUNK LFC values
-for (i in resNames){
-  x <- get(paste0("res.",i)) # call any of the res."" objects and assign to x 
-  y <- quantile(abs(x$log2FoldChange), na.rm=T,
-                type=8,
-                probs=seq(0,1,0.05)) #Probability values [0,1] in 0.05 intervals
-  z <- as.numeric(y["90%"]) # assign upper 90% quantile value as cut off to object z
-  if (z < 1){
-    message(paste0("
-   |LFcut| for res.",i," [",substance,"] ",round(z,2)))
-    assign(paste0("LFcut.",i),z) #assign the value z to new object LFcut."
-  } else {
-    message(paste0("
-     |LFcut| for res.",i," [",substance,"] ",round(z,2),"
-     LFcut.",i," > 1; Hence LFC cutoff set to: 1"))
-    assign(paste0("LFcut.",i),1) #assign the value 1 to new object LFcut."
-  }
-  rm(x,y,z,i)
-}
-#############################
-
-#### Append qvalue to res ####
-message("
-          Calculating qvalues
-        ")
-for (k in resNames){
-  # non-shrunk
-  res <- get(paste0("res.",k))
-  res$qval <- qvalue(res$pvalue)$qvalue
-  assign(paste0("res.",k),res)
-}
-for (k in resNames){
-  # lfs shrunk
-  res <- get(paste0("reslfs.",k))
-  res$qval <- qvalue(res$pvalue)$qvalue
-  assign(paste0("reslfs.",k),res)
-}
-rm(k,res)
-#############################
-
-### ANNOTATE GENES #####
-library(AnnotationDbi)
-library(org.Dr.eg.db)
-#BiocManager::install("org.Dr.eg.db")
-message(" Annotate DESeq2 results ...
-        ")
-# organism annotation package ("org") for Danio rerio ("Dr") organized as 
-# an AnnotationDbi database package ("db"), using Entrez Gene IDs ("eg") as primary key.
-# to install: BiocManager::install("org.Dr.eg.db")
-# https://www.bioconductor.org/packages/release/data/annotation/html/org.Dr.eg.db.html
-# citation("org.Dr.eg.db")
-# To get a list of all available key types, use:
-# columns(org.Dr.eg.db)
-
-# We can use the mapIds function to add individual columns to our results table
-# We provide the row names of our results table as a key, and specify that keytype=ENSEMBL
-db.keys.first <- c("ENTREZID",
-                   "SYMBOL",
-                   "GENENAME",
-                   "ZFIN"
-                   )
-db.keys.unique <- c("IPI",
-                    "ENZYME",
-                    "ENSEMBLPROT"
-                    #"UNIPROT",
-                    #"ONTOLOGY",
-                    #"GO",
-                    #"GOALL"
-                    )
-# for res
-for (k in resNames){
-  x <- get(paste0("res.",k))
-  for (i in db.keys.first){
-    anno <- mapIds(org.Dr.eg.db,
-                   keys=row.names(x),
-                   keytype="ENSEMBL",
-                   column= i,
-                   multiVals= "first")
-    x[,paste0(i)] <- anno
-  }
-  for (i in db.keys.unique){
-    anno <- mapIds(org.Dr.eg.db,
-                   keys=row.names(x),
-                   keytype="ENSEMBL",
-                   column= i,
-                   multiVals= "asNA") #only unique values get ID
-    x[,paste0(i)] <- anno
-  }
-  assign(paste0("res.",k),x)
-}
-# for reslfs
-for (k in resNames){
-  x <- get(paste0("reslfs.",k))
-  for (i in db.keys.first){
-    anno <- mapIds(org.Dr.eg.db,
-                   keys=row.names(x),
-                   keytype="ENSEMBL",
-                   column= i,
-                   multiVals= "first")
-    x[,paste0(i)] <- anno
-  }
-  for (i in db.keys.unique){
-    anno <- mapIds(org.Dr.eg.db,
-                   keys=row.names(x),
-                   keytype="ENSEMBL",
-                   column= i,
-                   multiVals= "asNA") #only unique values get ID
-    x[,paste0(i)] <- anno
-  }
-  assign(paste0("reslfs.",k),x)
-}
-rm(anno,k,i,x)
-detach("package:org.Dr.eg.db", unload = T)
-#####################
-
-### EXPORT RESULTS to Xcel #####
-message(" Exporting DESeq2 result tables. This might take a while.
- Saving to Xcel...")
-
-## DESEq2 res ##
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  #df <- as.data.frame(matrix(NA,length(rmv),ncol(res)),row.names = rmv)
-  #names(df) <- colnames(res)
-  #df <- rbind(res,df)
-  #stopifnot(nrow(df) == nrow(count.matrix)) # check if dataset is complete!
-  write.csv2(as.data.frame(res),
-             file = paste0("Results/",substance,"_res_",k,".csv"))
-  rm(k,res)
-}
-## DESEq2 reslfs ##
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  #df <- as.data.frame(matrix(NA,length(rmv),ncol(res)),row.names = rmv)
-  #names(df) <- colnames(res)
-  #df <- rbind(res,df)
-  #stopifnot(nrow(df) == nrow(count.matrix)) # check if dataset is complete!
-  write.csv2(as.data.frame(res),
-             file = paste0("Results/",substance,"_reslfs_",k,".csv"))
-  rm(k,res)
-}
-
-message(paste0(" DESeq2 result tables were stored in:
- ",getwd(),"/Results"))
-
-## DEGs ##
-message(" Exporting DEGs in Xcel tables 
- Saving ...")
-
-# Create output folders
-home <- getwd()
-setwd("DEGs/")
-dir.create("lfs")
-dir.create("lfsFCcut")
-dir.create("unshrink")
-dir.create("unshrinkFCcut")
-setwd(home)
-
-# padj cutoff 
-for (k in resNames){
-  # non-shrunk
-  res <- get(paste0("res.",k)) 
-  res1 <- subset(res[order(res$padj),], padj <= p)
-  
-  res2 <- get(paste0("res.",tail(resNames,1))) #this calls the last object of the resNames vector list; this is supposed to be the highest concentration tested!!!
-  res2 <- subset(res2, padj <= p)
-  elementHE <- is.element(rownames(res1),rownames(res2))
-  
-  res1 <- cbind(elementHE, as.data.frame(res1)) # TRUE if element part of DEGs in highest exposure (HE)
-  write.csv2(res1,file = paste0("DEGs/unshrink/",substance,"_pcut_",k,".csv"))
-  
-  # apeglm shrunk
-  res <- get(paste0("reslfs.",k)) 
-  res1 <- subset(res[order(res$padj),], padj <= p)
-  
-  res2 <- get(paste0("reslfs.",tail(resNames,1))) #this calls the last object of the resNames vector list; this is supposed to be the highest concentration tested!!!
-  res2 <- subset(res2, padj <= p)
-  elementHE <- is.element(rownames(res1),rownames(res2))
-  
-  res1 <- cbind(elementHE, as.data.frame(res1)) # TRUE if element part of DEGs in highest exposure (HE)
-  write.csv2(res1,file = paste0("DEGs/lfs/",substance,"_lfs_pcut",k,".csv"))
-}
-
-# padj & LFC cutoff
-# assign
-for (k in resNames){
-  # non-shrunk
-  res <- get(paste0("res.",k)) 
-  LFcut <- get(paste0("LFcut.",k))
-  res1 <- subset(res[order(res$padj),],log2FoldChange>LFcut | log2FoldChange<(-LFcut))
-  assign(paste0("res.",k,".LFcut"),res1)
-  
-  # apeglm shrunk
-  res <- get(paste0("reslfs.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  res1 <- subset(res[order(res$padj),],log2FoldChange>LFcut | log2FoldChange<(-LFcut))
-  assign(paste0("reslfs.",k,".LFcut"),res1)
-}
-# export
-for(k in resNames){
-  # non-shrunk
-  res1 <- get(paste0("res.",k,".LFcut"))
-  res1 <- subset(res1, padj <= p)
-  res2 <- get(paste0("res.",tail(resNames,1),".LFcut")) #this calls the last object of the resNames vector list; this is supposed to be the highest concentration tested!!!
-  res2 <- subset(res2, padj <= p)
-  elementHE <- is.element(rownames(res1),rownames(res2))
-  
-  res1 <- cbind(elementHE, as.data.frame(res1)) # TRUE if element part of DEGs in highest exposure (HE)
-  write.csv2(res1,file = paste0("DEGs/unshrinkFCcut/",substance,"_pcut_LFcut",k,".csv"))
-  
-  # apeglm shrunk
-  res1 <- get(paste0("reslfs.",k,".LFcut"))
-  res1 <- subset(res1, padj <= p)
-  res2 <- get(paste0("reslfs.",tail(resNames,1),".LFcut")) #this calls the last object of the resNames vector list; this is supposed to be the highest concentration tested!!!
-  res2 <- subset(res2, padj <= p)
-  elementHE <- is.element(rownames(res1),rownames(res2))
-  
-  res1 <- cbind(elementHE, as.data.frame(res1)) # TRUE if element part of DEGs in highest exposure (HE)
-  write.csv2(res1,file = paste0("DEGs/lfsFCcut/",substance,"_lfs_pcut_LFcut",k,".csv"))
-}
-rm(res,res1,res2,LFcut,k,elementHE)
-message(paste0(" 
-Finished DESeq2 Statistical testing.
-Start with plotting the DESeq2 results.
- "))
-##############################
-
-############################################ PLOTTING ##############################################
-message(" 
- Start Data Composition and QC plotting ...")
-### QC - dispersion estimates for DESeq2's normalization model ----
-pdf(file = paste0("Plots/DataQC/",substance,"_DispEstimates.pdf"), #print directly to pdf
-    width = 7, height = 5.9,
-    onefile = T,        #multiple figures in one file
-    bg = "transparent" #Background color
-)
-for(i in fitType){
-  print(
-    plotDispEsts(estDisp.ls[[i]], main = paste(substance,'- DESeq2 fit type:',i))
-    )
-}
-dev.off()
-rm(estDisp.ls)
-
-##################################################################
-
-### QC - pvalue and LFC distribution #####
-#pdf(file = paste0("Plots/DataQC/",substance,"_pvalue_LFC_distr.pdf"), #print directly to pdf
-#    width = 4*length(resNames), height = 12, onefile = T, bg = "transparent")
-## res -------
-png(filename = paste0("Plots/DataQC/",substance,"_pvalue_LFC_distr.png"),
-    width = 6*length(resNames), height = 18, units = "cm", bg = "white",
-    pointsize = 7, res = 450)
-par(mfrow=c(3,length(resNames)))
-# loop for pvalue distr 
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  hist(res@listData[["pvalue"]],
-       main= paste0(substance," - res.",k),
-       col = "gray50",
-       border = "gray50",
-       ylab = "Frequency",
-       xlab = "pvalues",
-       breaks = 500)
-}
-# loop for pvalue vs padj (BH) & qval 
-q <- 0.05 #specify Q value cut off
-pval <- 0.05 # specify pval cut off 
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  plot(res@listData[["pvalue"]],res@listData[["padj"]],
-       xlab="pvalues",
-       ylab="conversion of pvalues",
-       xlim= c(0,0.25),
-       main= paste0(substance," - res.",k),
-       col = "dodgerblue1",
-       pch = 20
-  )
-  points(res@listData[["pvalue"]],res@listData[["qval"]], 
-         col="springgreen3", 
-         pch = 20)
-  xpos <- 0.1
-  abline(h=0.05, lwd=1, lty=2)
-  abline(v=0.05, lwd=1, lty=2)
-  legend(x=xpos,y=0.225,
-         text.col = "black",
-         bty = "n",
-         legend = paste("Genes with pvalue <",pval,":",sum(res$pvalue <= pval, na.rm = T))
-  )
-  legend(x=xpos,y=0.135,
-         text.col = "springgreen3",
-         bty = "n",
-         legend = paste("Genes with Qvalue <",q,":",sum(res$qval <= q, na.rm = T))
-  )
-  legend(x=xpos,y=0.045,
-         text.col = "dodgerblue",
-         bty = "n",
-         legend = paste("Genes with padj (BH) <",p,":",sum(res$padj <= p, na.rm = T))
-  )
-}
-rm(k,res)
-  # loop for LFC distribution
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  hist(res$log2FoldChange,
-       breaks = 1000,
-       main=paste0(substance," - res.",k),
-       col = "gray50",
-       border = "gray50",
-       xlab = "Log2 FC",
-       #xlim = c(-7*LFcut,7*LFcut),
-       #ylim = c(0,3000),
-       xlim = c(-2,2)
-  )
-  abline(v=c(LFcut,-LFcut), 
-         col="dodgerblue",
-         lty = 2,
-         lwd= 1 )
-  legend(x="topright",
-         text.col = "dodgerblue",
-         bty = "n",
-         legend = paste("LFcut =",round(LFcut, digits = 2)))
-  rm(res,k)
-}
-dev.off()
-
-## reslfs --------
-png(filename = paste0("Plots/DataQC/",substance,"_pvalue_lfsLFC_distr.png"),
-    width = 6*length(resNames), height = 18, units = "cm", bg = "white",
-    pointsize = 7, res = 450)
-par(mfrow=c(3,length(resNames)))
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  hist(res@listData[["pvalue"]],
-       main= paste0(substance," - reslfs.",k),
-       col = "gray50",
-       border = "gray50",
-       ylab = "Frequency",
-       xlab = "pvalues",
-       breaks = 500)
-}
-# loop for pvalue vs padj (BH) & qval
-q <- 0.05 #specify Q value cut off
-pval <- 0.05 # specify pval cut off 
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  plot(res@listData[["pvalue"]],res@listData[["padj"]],
-       xlab="pvalues",
-       ylab="conversion of pvalues",
-       xlim= c(0,0.25),
-       main= paste0(substance," - reslfs.",k),
-       col = "dodgerblue1",
-       pch = 20
-  )
-  points(res@listData[["pvalue"]],res@listData[["qval"]], 
-         col="springgreen3", 
-         pch = 20)
-  xpos <- 0.1
-  abline(h=0.05, lwd=1, lty=2)
-  abline(v=0.05, lwd=1, lty=2)
-  legend(x=xpos,y=0.225,
-         text.col = "black",
-         bty = "n",
-         legend = paste("Genes with pvalue <",pval,":",sum(res$pvalue <= pval, na.rm = T))
-  )
-  legend(x=xpos,y=0.135,
-         text.col = "springgreen3",
-         bty = "n",
-         legend = paste("Genes with Qvalue <",q,":",sum(res$qval <= q, na.rm = T))
-  )
-  legend(x=xpos,y=0.045,
-         text.col = "dodgerblue",
-         bty = "n",
-         legend = paste("Genes with padj (BH) <",p,":",sum(res$padj <= p, na.rm = T))
-  )
-}
-rm(k,res)
-# loop for LFC distribution
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  hist(res$log2FoldChange,
-       breaks = 1000,
-       main=paste0(substance," - reslfs.",k),
-       col = "gray50",
-       border = "gray50",
-       xlab = "Log2 FC",
-       #xlim = c(-7*LFcut,7*LFcut),
-       #ylim = c(0,3000),
-       xlim = c(-2,2)
-  )
-  abline(v=c(LFcut,-LFcut), 
-         col="dodgerblue",
-         lty = 2,
-         lwd= 1 )
-  legend(x="topright",
-         text.col = "dodgerblue",
-         bty = "n",
-         legend = paste("LFcut =",round(LFcut, digits = 2)))
-  rm(res,k)
-}
-dev.off()
-#######################################
-
-### QC - RLE COUNT NORMALISATION ####
-# plotting raw counts and mean counts next to each other 
-pdf(file = paste0("Plots/DataQC/",substance,"_RLE_normalisation.pdf"), #print directly to pdf
-    width = 1.3*nrow(coldata),       
-    height = 11,
-    onefile = T,        #multiple figures in one file
-    title = "",
-    #paper = "a4",         #a4r = landscape DinA4 (r=rotated)
-    bg = "transparent", #Background color
-    fg ="black"         #Foreground color
-)
-par(mfrow=c(2,2))
-
-barplot(colSums(counts(dds)),
-        #xlab = "Samples",
-        ylab = "Total gene counts",
-        main = "Raw counts",
-        las = 3, #rotating sample labels 90
-        ylim = c(0,1.2*max(colSums(counts(dds))))
-)
-barplot(colSums(counts(dds, normalized=T)),  #plot mean normalized counts
-        #xlab = "Samples",
-        ylab = "Total gene counts",
-        main = "RLE normalized counts",
-        las = 3, #rotating sample labels 90
-        ylim = c(0,1.2*max(colSums(counts(dds))))
-)
-boxplot(log10(counts(dds)+1),
-        #xlab="Samples",
-        ylab="Log10(Gene counts + 1)",
-        las = 3, #rotating sample labels 90
-        main="Raw counts")
-boxplot(log10(counts(dds, normalized=T)+1),
-        #xlab="Samples",
-        ylab="Log10(Gene counts + 1)",
-        las = 3, #rotating sample labels 90
-        main="RLE normalized counts")
-dev.off()
-####################################
-
-### QC - RLE NORMALIZED COUNT TRANSFORMATION ####
-pdf(file = paste0("Plots/DataQC/",substance,"_NormCount_Transformation.pdf"), #print directly to pdf
-    width = 5*length(resNames),       
-    height = 4,
-    onefile = T,        #multiple figures in one file
-    title = "RLE normalized Count's transformation",
-    #paper = "a4",         #a4r = landscape DinA4 (r=rotated)
-    bg = "transparent", #Background color
-    fg ="black"         #Foreground color
-)
-# plot...
-par(mfrow=c(1,3))
-boxplot(df.counts, notch = TRUE,
-        las = 3, #rotating sample labels 90
-        main = "Normalized read counts - No zero counts",
-        ylab = "read counts")
-
-boxplot(df.ntd, notch = TRUE,
-        las = 3, #rotating sample labels 90
-        main = "log2 Transformation",
-        ylab = "log2 (norm. read counts + 1)")
-
-boxplot(df.rld, notch = TRUE,
-        las = 3, #rotating sample labels 90
-        main = "rlog Transformation",
-        ylab = "rlog (norm. read counts)")
-
-dev.off()
-while (!is.null(dev.list()))  dev.off()
-################################################
-
-### QC - PearsonCor biol. replicates ####
-skip <- T
-if(skip == F){
-  # This section of code assumes 3 biol. replicates! If this differs please change manually!
-  pdf(file = paste0("Plots/DataQC/",substance,"_Correlation.pdf"), 
-      width = 3.33333*length(ID.Control),       
-      height = 3.6*length(condition),
-      onefile = T,        #multiple figures in one file
-      title = "",
-      #paper = "a4",         #a4r = landscape DinA4 (r=rotated)
-      bg = "transparent", #Background color
-      fg ="black"         #Foreground color
-  )
-  par(mfrow=c(length(condition),length(ID.Control)))
-  
-  list <- c("df.counts","df.ntd","df.rld")
-  for (k in list){
-    df <- get(k)
-    for (i in condition){
-      ID <- get(paste0("ID.",i)) # Get object containing Sample IDs for a specific condition
-      #1
-      plot(df[,c(ID[1],ID[2])],
-           cex =.1,
-           main = paste("norm. reads -",i,"[",coldata[ID[1],"Tank"],"vs",coldata[ID[2],"Tank"],"]")
-      )
-      x <- df[,ID[1]]
-      y <- df[,ID[2]]
-      legend(x="bottomright", legend = paste("Pearson Cor =",round(cor(x,y),3)))
-      #2
-      plot(df[,c(ID[1],ID[3])],
-           cex =.1,
-           main = paste("norm. reads -",i,"[",coldata[ID[1],"Tank"],"vs",coldata[ID[3],"Tank"],"]")
-      )
-      x <- df[,ID[1]]
-      y <- df[,ID[3]]
-      legend(x="bottomright", legend = paste("Pearson Cor =",round(cor(x,y),3)))
-      #3
-      plot(df[,c(ID[2],ID[3])],
-           cex =.1,
-           main = paste("norm. reads -",i,"[",coldata[ID[2],"Tank"],"vs",coldata[ID[3],"Tank"],"]")
-      )
-      x <- df[,ID[2]]
-      y <- df[,ID[3]]
-      legend(x="bottomright", legend = paste("Pearson Cor =",round(cor(x,y),3)))
-      rm(i,ID,x,y)
-    }
-  }
-  rm(k,list,df)
-  dev.off()
-  while (!is.null(dev.list()))  dev.off()
-}
-########################################
-
-### QC - PearsonCor biol. replicates - SHINY ####
-## plot function ##
-corplot.1 <- function(df1) ggplot(df1) +
-  geom_point(aes(x, y, col = d), size = .8, alpha = .4) +
-  labs(x=paste0(ID[p1],transf),y=paste0(ID[p2],transf),
-       title = (paste0(substance,": ",i)),
-       subtitle = (paste("[",coldata[ID[p1],"Tank"],"vs",coldata[ID[p2],"Tank"],"]"))) +
-  annotate("text",
-           label = paste0("Pearson = ",round(cor(df1$x,df1$y),2)),
-           x = (max(df1$x)), 
-           y = (min(df1$y)),
-           hjust=1, vjust=0) + 
-  annotate("text",
-           label = paste0("R2 = ",round((cor(df1$x,df1$y))^2,2)),
-           x = (min(df1$x)), 
-           y = (max(df1$y)),
-           hjust=0, vjust=1) + 
-  scale_color_identity() +
-  coord_equal(ratio=1) + 
-  theme_bw()
-
-# This section of code assumes 3 biol. replicates! If this differs please change manually!
-#pdf(file = paste0("Plots/DataQC/",substance,"_Correlation_shiny.pdf"), 
-#    width = 4.33333*length(ID.Control), height = 4.6*length(condition), onefile = T, bg = "transparent")
-
-# Log10 mean counts -------------------------------------------------------------------
-png(filename = paste0("Plots/DataQC/",substance,"_Correlation_log10.png"),
-    width = 7.33333*length(ID.Control), height = 7.6*length(condition), units = "cm", bg = "white",
-    pointsize = 1, res = 450)
-df <- df.ntd #INPUT 
-transf <- " - [log2(reads+1)]"
-gg.list <- list()
-for (i in condition){
-  ID <- get(paste0("ID.",i)) # Get object containing Sample IDs for a specific condition
-  p1 <- 1 #ID vector position
-  p2 <- 2 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-  
-  p1 <- 1 #ID vector position
-  p2 <- 3 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-  
-  p1 <- 2 #ID vector position
-  p2 <- 3 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-}
-ggobj <- ls(gg.list)
-print(ggpubr::ggarrange(plotlist = gg.list, ncol = 3, nrow = (length(ggobj)/3)))
-dev.off()
-
-# rlog mean counts --------------------------------------------------------------------
-png(filename = paste0("Plots/DataQC/",substance,"_Correlation_rlog.png"),
-    width = 7.33333*length(ID.Control), height = 7.6*length(condition), units = "cm", bg = "white",
-    pointsize = 1, res = 450)
-df <- df.rld #INPUT
-transf <- " - [rlog(reads)]"
-gg.list <- list()
-for (i in condition){
-  ID <- get(paste0("ID.",i)) # Get object containing Sample IDs for a specific condition
-  p1 <- 1 #ID vector position
-  p2 <- 2 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-  
-  p1 <- 1 #ID vector position
-  p2 <- 3 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-  
-  p1 <- 2 #ID vector position
-  p2 <- 3 #ID vector position
-  df1 <- data.frame(x = df[,ID[p1]],
-                    y = df[,ID[p2]],
-                    d = densCols(df[,ID[p1]], df[,ID[p2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
-  )
-  gg.list[[paste0(i,".",ID[p1],"vs",ID[p2])]] <- corplot.1(df1)
-}
-ggobj <- ls(gg.list)
-print(ggpubr::ggarrange(plotlist = gg.list, ncol = 3, nrow = (length(ggobj)/3)))
-dev.off()
-################################################
-
-### QC - meanSdPlot DATA VARIANCE ####
-#BiocManager::install("vsn")
-library(vsn)
-# plotting SD of transformed data across samples against the mean count
-sdp1 <- meanSdPlot(df.counts, ranks = T, plot = F)
-sdp1 <- sdp1$gg + ggtitle("Mean counts - Ranked")+scale_y_continuous(trans='log10')+ylab("sd (log10 scale)") +
-  theme_bw()
-
-sdp2 <- meanSdPlot(df.ntd, ranks = T, plot = F)
-sdp2 <- sdp2$gg + ggtitle("log2 (mean counts) - Ranked") +
-  theme_bw() #+ ylim(0,3)
-
-sdp3 <- meanSdPlot(df.rld, ranks = T, plot = F)
-sdp3 <- sdp3$gg + ggtitle("rlog (mean counts) - Ranked") +
-  theme_bw() #+ ylim(0,3)
-
-sdp1b <- meanSdPlot(df.counts, ranks = F, plot = F) #original scale with ranks=F
-sdp1b <- sdp1b$gg + ggtitle("Mean counts") +
-  theme_bw()
-
-sdp2b <- meanSdPlot(df.ntd, ranks = F, plot = F) #original scale with ranks=F
-sdp2b <- sdp2b$gg + ggtitle("log2 (mean counts)") +
-  theme_bw() #+ ylim(0,3)
-
-sdp3b <- meanSdPlot(df.rld, ranks = F, plot = F) #original scale with ranks=F
-sdp3b <- sdp3b$gg + ggtitle("rlog (mean counts)") + 
-  theme_bw()#+ ylim(0,3)
-
-pdf(file = paste0("Plots/DataQC/",substance,"_meanSD.pdf"), #print directly to pdf
-    width = 17,       
-    height = 9.6,
-    onefile = T,           #multiple figures in one file
-    title = "",
-    #paper = "a4r",         #a4r = landscape DinA4 (r=rotated)
-    bg = "transparent", #Background color
-    fg ="black"         #Foreground color
-)
-print(ggarrange(sdp1, sdp2, sdp3, sdp1b, sdp2b, sdp3b,
-                labels = c("A1", "B1", "C1","A2", "B2", "C2"),
-                ncol = 3, nrow =2))
-dev.off()
-# Clean out env
-rm(sdp1,sdp2,sdp3,sdp1b,sdp2b,sdp3b)
-detach("package:vsn", unload = TRUE)
-
-
-#####################################
-
-### MA plots & Vulcano plots ####
-MAfun <- function(res,title,topgenes, Symbol, shrink, LFcut){
-  if(missing(title)){title = ''}
-  if(missing(shrink)){shrink = F}
-  if(missing(Symbol)){Symbol = F}
-  if(missing(topgenes)){topgenes = 10}
-  ggpubr::ggmaplot(
-    res, 
-    fdr = p, fc = 2^(LFcut), size = .6,
-    top = topgenes,
-    select.top.method = 'fc', # fc or padj
-    palette = c("#B31B21", "#1465AC", "darkgray"),
-    main = paste(substance,title,"[ LFcut:",round(LFcut,2),"]"),
-    legend = "bottom",
-    genenames = if(Symbol == F){NULL}else{as.vector(res$SYMBOL)},
-    ylab = if(shrink == F){bquote(~Log[2]~ "fold change")}else{bquote("apeglm ("~Log[2]~"fc)")},
-    xlab = bquote(~Log[2]~ "mean expression"),
-    font.label = c("bold", 11), label.rectangle = F,
-    font.legend = "bold",
-    font.main = "bold",
-    ggtheme = ggplot2::theme_light()
-  ) + theme(aspect.ratio = 1, plot.title = element_text(size = 10, face = 'plain'), #line = element_line(size = .1),
-            axis.text = element_text(size = 10),
-            axis.title = element_text(size = 10),
-            legend.text = element_text(size = 10),
-            text = element_text(size = 1.5, face = 'plain')) +
-    geom_text(aes(x = max(log2(res$baseMean))-.6, y = LFcut+.3, label = round(LFcut,2)), size = 3) + 
-    geom_text(aes(x = max(log2(res$baseMean))-.65, y = -LFcut-.3, label = round(-LFcut,2)), size = 3)
-  #+ geom_hline(yintercept = c(-LFcut,LFcut)) # to display lf cut line
-}
-VulcFun <- function(res,title,topgenes, Symbol, shrink, LFcut){
-  if(missing(shrink)){shrink = F}
-  if(missing(title)){title = ''}
-  if(missing(topgenes)){topgenes = 10}
-  if(missing(Symbol)){Symbol = F}
-  
-  if(Symbol == T){
-    select <- res[order(res$padj),"SYMBOL"]}else{
-      select <- rownames(res[order(res$padj),])}
-  
-  #BiocManager::install("EnhancedVolcano")
-  EnhancedVolcano::EnhancedVolcano(
-    res, x = "log2FoldChange", y = "padj",
-    title = paste(substance,title,"[ LFcut:",round(LFcut,2),"]"),
-    #subtitle = if(shrink == F){"IHW; Non-shrunk"}else{"IHW; apeglm"},
-    subtitle = NULL,
-    lab = if(Symbol == F){rownames(res)}else{res$SYMBOL},
-    selectLab = if(topgenes == 0){select[NULL]}else{select[1:topgenes]}, # select topgenes based on padj value
-    legendLabels = c('NS','Log2 FC','padj','padj & Log2 FC'),
-    xlab =  if(shrink == F){bquote(~Log[2]~ "fold change")}else{bquote("apeglm ("~Log[2]~"fc)")},
-    ylab = bquote(~-Log[10]~italic(padj)),
-    FCcutoff = LFcut,  #default 1
-    pCutoff = p,       #default 10e-6
-    labSize = 3.0,
-    pointSize = .85, #default 0.8
-    col = c("grey30", "grey30", "royalblue", "red2"),
-    shape = c(1, 0, 17, 19),   #default 19, http://sape.inf.usi.ch/quick-reference/ggplot2/shape for details
-    colAlpha = 0.4, #default 0.5
-    hline = c(0.01, 0.001),
-    hlineCol = c('grey40','grey55'),
-    hlineType = 'dotted',
-    hlineWidth = 0.6,
-    gridlines.major = T,
-    gridlines.minor = T,
-    drawConnectors = TRUE,
-    #widthConnectors = 0.2,
-    #colConnectors = 'grey15'
-  ) + theme_light() +
-    theme(aspect.ratio = 1, plot.title = element_text(size = 10, face = 'plain'), line = element_line(size = .6),
-          axis.text = element_text(size = 10),
-          axis.title = element_text(size = 10),
-          legend.text = element_text(size = 10),
-          legend.position = "none")
-}
-# NON SHRUNK -----
-gg.list <- list() # Create gg.list to store plotting objects
-# ENSEMBL IDs
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  # MA plot
-  gg <- MAfun(res, topgenes = 0, LFcut = LFcut,  title = paste("-",k))
-  n <- paste0("MA.",k)
-  gg.list[[n]] <- gg
-  # Vulcano
-  gg <- VulcFun(res, topgenes = 0, LFcut = LFcut, title = paste("-",k))
-  n <- paste0("Vulc.",k)
-  gg.list[[n]] <- gg
-  #rm(gg,n,res,LFcut)
-}
-# SYMBOL
-for (k in resNames){
-  res <- get(paste0("res.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  # MA plot
-  gg <- MAfun(res, topgenes = 10,LFcut = LFcut, title = paste("-",k), Symbol = T)
-  n <- paste0("symMA.",k)
-  gg.list[[n]] <- gg
-  # Vulcano
-  gg <- VulcFun(res, topgenes = 10,LFcut = LFcut, title = paste("-",k), Symbol = T)
-  n <- paste0("symVulc.",k)
-  gg.list[[n]] <- gg
-  #rm(gg,n,res,LFcut)
-}
-# plotting: 
-message(" 
- Start Shiny MA & Vulcano plotting ...")
-
-pdf(file = paste0("Plots/",substance,"_MAplots_Vulcano.pdf"), #print directly to pdf
-    width = 4*length(resNames), height = 8, onefile = T, bg = "transparent")
-x <- length(names(gg.list))/2
-plotseq <- c(grep('MA.',names(gg.list)[1:x]),
-             grep('Vulc.',names(gg.list)[1:x]))
-print(ggpubr::ggarrange(plotlist = gg.list[plotseq], ncol = length(resNames), nrow =2))
-print(ggpubr::ggarrange(plotlist = gg.list[plotseq+x], ncol = length(resNames), nrow =2))
-dev.off()
-while (!is.null(dev.list()))  dev.off()
-
-# SHRUNK -----
-# Create gg.list to store objects for plotting in there
-gg.list <- list()
-# ENSEMBL IDs
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  # MA plot
-  gg <- MAfun(res, topgenes = 0, LFcut = LFcut, title = paste("-",k), shrink = T)
-  n <- paste0("MA.",k)
-  gg.list[[n]] <- gg
-  # Vulcano
-  gg <- VulcFun(res, topgenes = 0, LFcut = LFcut, title = paste("-",k), shrink = T)
-  n <- paste0("Vulc.",k)
-  gg.list[[n]] <- gg
-  rm(gg,n,res,LFcut)
-}
-# SYMBOL
-for (k in resNames){
-  res <- get(paste0("reslfs.",k))
-  LFcut <- get(paste0("LFcut.",k))
-  # MA plot
-  gg <- MAfun(res, topgenes = 10, LFcut = LFcut, title = paste("-",k), Symbol = T, shrink = T)
-  n <- paste0("symMA.",k)
-  gg.list[[n]] <- gg
-  # Vulcano
-  gg <- VulcFun(res, topgenes = 10, LFcut = LFcut, title = paste("-",k), Symbol = T, shrink = T)
-  n <- paste0("symVulc.",k)
-  gg.list[[n]] <- gg
-  #rm(gg,n,res,LFcut)
-}
-# plotting: 
-message(" 
- Start Shiny MA & Vulcano plotting ...")
-
-pdf(file = paste0("Plots/",substance,"_MAplots_Vulcano_lfs.pdf"), #print directly to pdf
-    width = 4*length(resNames), height = 8, onefile = T, bg = "transparent")
-x <- length(names(gg.list))/2
-plotseq <- c(grep('MA.',names(gg.list)[1:x]),
-             grep('Vulc.',names(gg.list)[1:x]))
-
-gg.list$Vulc.Low
-
-
-print(ggpubr::ggarrange(plotlist = gg.list[plotseq], ncol = length(resNames), nrow =2))
-print(ggpubr::ggarrange(plotlist = gg.list[plotseq+x], ncol = length(resNames), nrow =2))
-dev.off()
-while (!is.null(dev.list()))  dev.off()
-################################
-
-### Venn Diagram ####
-# Display overlapping gene clusters for DEGs across all treatments
-# 1) padj 
-# 2) padj LFcut 
-# 3) lfs padj 
-# 4) lfs padj LFcut
-message(" 
- Start Shiny Venn Diagram plotting ...")
-pdf(file = paste0("Plots/",substance,"_Venn.pdf"),
-    #paper = "a4",
-    onefile = T,
-    bg = "transparent", #Background color
-    fg ="black",        #Foreground color
-    width = 9.7,
-    height = 8)
-
-# make color palette 
-#colors <- gplots::greenred(length(resNames))
-#colors <- heat.colors(length(resNames))
-#colors <- rainbow(length(resNames))
-colors <- topo.colors(length(resNames))
-
-# create empty list to store objects in there
-venn.ls <- list()
-for(k in resNames){
-  res <- get(paste0("res.",k))
-  x <- rownames(subset(res, padj < p))
-  venn.ls[[k]] <- x
-  rm(res,x)
-}
-gg <- plot(eulerr::euler(venn.ls),
-           fills = list(fill = colors, alpha = 0.4),
-           labels = list(col = "black", font = 4),
-           legend = list(col = "black", font = 4),
-           main = paste0(" [padj <",p,"]"),
-           quantities = TRUE,
-           shape = "ellipse",
-           lty = 0)
-print(gg)
-
-#LFcut
-venn.ls <- list()
-for(k in resNames){
-  res <- get(paste0("res.",k,".LFcut"))
-  x <- rownames(subset(res, padj < p))
-  n <- paste0(k,".LFcut")
-  venn.ls[[n]] <- x
-  rm(res,x,n)
-}
-gg <- plot(eulerr::euler(venn.ls),
-           fills = list(fill = colors, alpha = 0.4),
-           labels = list(col = "black", font = 4),
-           legend = list(col = "black", font = 4),
-           main = paste0(" [padj <",p,"]"),
-           quantities = TRUE,
-           shape = "ellipse",
-           lty = 0)
-print(gg)
-
-# lfs
-venn.ls <- list()
-for(k in resNames){
-  res <- get(paste0("reslfs.",k))
-  x <- rownames(subset(res, padj < p))
-  n <- paste0(k,".lfs")
-  venn.ls[[n]] <- x
-  rm(res,x,n)
-}
-gg <- plot(eulerr::euler(venn.ls),
-           fills = list(fill = colors, alpha = 0.4),
-           labels = list(col = "black", font = 4),
-           legend = list(col = "black", font = 4),
-           main = paste0(" [padj <",p,"]"),
-           quantities = TRUE,
-           shape = "ellipse",
-           lty = 0)
-print(gg)
-
-#lfs & LFcut
-venn.ls <- list()
-for(k in resNames){
-  res <- get(paste0("reslfs.",k,".LFcut"))
-  x <- rownames(subset(res, padj < p))
-  n <- paste0(k,".lfsLFcut")
-  venn.ls[[n]] <- x
-  rm(res,x,n)
-}
-gg <- plot(eulerr::euler(venn.ls),
-           fills = list(fill = colors, alpha = 0.4),
-           labels = list(col = "black", font = 4),
-           legend = list(col = "black", font = 4),
-           main = paste0(" [padj <",p,"]"),
-           quantities = TRUE,
-           shape = "ellipse",
-           lty = 0)
-print(gg)
-dev.off()
-rm(venn.ls,gg,colors)
-####################
-
-### HCLUST ####
-message(" 
- Start Hierarchical Clustering ...")
-## Pearson
-pdf(paste0("Plots/",substance,"_hclust.pdf"),
-    paper = "a4r",
-    onefile = T,
-    bg = "transparent", #Background color
-    fg ="black",        #Foreground color
-    width = 11.6,
-    height = 8.5)
-par(mfrow=c(2,3))
-for (k in c("average","complete","mcquitty")){
-  for(i in c("euclidean", "canberra", "clark", "bray", "kulczynski", "jaccard")){
-    dis <- vegan::vegdist(1-cor(df.rld, method = "pearson"),
-                          method = i)
-    plot(hclust(dis, method = k), # clustering: "single", "complete", "average", "mcquitty", "median" or "centroid"
-         labels = paste(rld$Condition, rld$Tank, sep="-"),
-         ylab = "Pearson correlation",
-         main = paste(i))
-  }
-}
-## Spearman
-for (k in c("average","complete","mcquitty")){
-  for(i in c("euclidean", "canberra", "clark", "bray", "kulczynski", "jaccard")){
-    dis <- vegan::vegdist(1-cor(df.rld, method = "spearman"),
-                          method = i)
-    plot(hclust(dis, method = k), # clustering: "single", "complete", "average", "mcquitty", "median" or "centroid"
-         labels = paste(rld$Condition, rld$Tank, sep="-"),
-         ylab = "Spearman correlation",
-         main = paste(i))
-  }
-}
-dev.off()
-##############
-
-### Sample Distance Mtx ####
-message(" 
- Start Sample Distance Mtx Heatmap  ...")
-pdf(file = paste0("Plots/",substance,"_SampleDistMtx.pdf"), #print directly to pdf
-    width = ncol(df.rld), height = (2/3)*ncol(df.rld), onefile = T, bg = "transparent",
-)
-for(method in c('euclidean','maximum','manhattan')){
-  # transpose input, calculate sample distance and create a distance matrix
-  sampleDist <- dist(t(df.rld), method = method) #must be one of "euclidean", "maximum", "manhattan", "canberra", "binary" or "minkowski"
-  distMtx <- as.matrix(sampleDist)
-  rownames(distMtx) <- paste(rld$Condition, rld$Tank, sep="-")
-  # create annotation object for heatmap
-  ann_col <- subset(coldata, select = 'Condition')
-  ann_row <- subset(coldata, select = 'Tank')
-  rownames(ann_row) <- paste(rld$Condition, rld$Tank, sep="-")
-  # set colors
-  Tanks <- levels(as.factor(coldata$Tank))
-  Conditions <- levels(as.factor(coldata$Condition))
-  col.Cond <- colorRampPalette(c('green',"gold1","indianred3"))(length(Conditions))
-  col.Tank <- colorRampPalette(c("gray95","gray50"))(length(Tanks))
-  ann_colors <- list(Condition = setNames(col.Cond, Conditions),
-                     Tank = setNames(col.Tank, Tanks))
-  colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(65)
-  # plot heatmap
-  print(
-    pheatmap::pheatmap(
-      distMtx,
-      angle_col = "90",
-      treeheight_col = 40, #default 50
-      fontsize = 12, #default 10
-      drop_levels = T,
-      display_numbers = T,
-      number_format = if(method == 'manhattan'){'%1.0f'}else{'%.1f'},
-      fontsize_number = 0.7*12,
-      main = paste0(substance,' - SampleDist [',method,']'),
-      clustering_distance_rows = sampleDist,
-      clustering_distance_cols = sampleDist,
-      cellwidth = 26,
-      cellheight = 26,
-      annotation_col = ann_col, # Condition!
-      annotation_row = ann_row, # Tank!
-      annotation_colors = ann_colors,
-      col = colors
-    )
-  )
-}
-rm(sampleDist,distMtx,disMethod,ann_col,ann_row,ann_colors,colors)
-dev.off()
-while(!is.null(dev.list())) dev.off()
-###########################
-
-### PCA & t-SNE ####
-message(" 
- Start t-SNE & PCA plotting ...")
-# rlog
-X <- df.rld 
-gg.list <- list()
-for (top in c(100,500,1000,nrow(df.rld))){
-  ### PCA -----------
-  col <- colorRampPalette(c('green',"gold1","indianred3"))(length(Conditions))
-  pca <- plotPCA(rld, intgroup = c("Condition","Tank"), returnData=T, ntop=top) 
-  percentVar <- round(100 * attr(pca, "percentVar"),1)
-  pca <- ggplot(pca, aes(PC1, PC2, color=Condition, shape=Tank),size=3) +
-    geom_point(size=3, alpha = .7) +
-    ggtitle(paste0(substance," rlog(counts) ntop: ",top," ; ",sum(percentVar),"% Var")) +
-    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
-    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
-    scale_colour_manual(values = col) +
-    #coord_fixed() +
-    theme_bw() +
-    theme(aspect.ratio = 1)
-  n <- paste0("PCA_",top)
-  gg.list[[n]] <- pca
-  
-  ### t-SNE -----------
-  # Subsetting the top genes with max variance
-  Xvar <- apply(df.rld,1,var)
-  Xvar <- sort(Xvar, decreasing = T)
-  select <- names(Xvar[1:top])
-  X <- df.rld[select,]
-  Xt <- t(X)
-  # perform Rtsne calc.
-  perplex <- (nrow(Xt)-1)/3
-  set.seed(42) #to make results reproducable! 
-  tsne <- Rtsne::Rtsne(Xt, 
-                dims = 2, 
-                initial_dims = ncol(X),
-                #initial_dims = 50,
-                perplexity = perplex, #(should not be bigger than 3 * perplexity < nrow(X) - 1, see details for interpretation)
-                theta = 0.0, #Speed/accuracy trade-off (increase for less accuracy), set to 0.0 for exact TSNE (default: 0.5)
-                check_duplicates = F,
-                pca = TRUE, 
-                partial_pca = F, #(requires the irlba package). This is faster for large input matrices (default: FALSE)
-                max_iter = 10000, #number of iterations
-                is_distance = FALSE,
-                pca_center = TRUE, 
-                pca_scale = FALSE,
-                normalize = F, #Default True; Set to F as RLE norm was performed prior! 
-                verbose = T,
-                num_threads = 2)
-  # ggplot
-  ggtsne <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2],
-                       row.names = rownames(coldata),
-                       Condition = coldata$Condition,
-                       Tank = coldata$Tank,
-                       ExtrDate = coldata$SamplingDate)
-  gg <- ggplot(ggtsne)+geom_point(aes(x=x,y=y,color = Condition,shape = Tank),size=3, alpha = .7)+
-    ggtitle(paste0(substance,": t-SNE on rlog[mean counts]; ntop: ",top)) +
-    xlab('t-SNE 1') + ylab('t-SNE 2') +
-    scale_colour_manual(values = col) +
-    theme_bw() +
-    theme(aspect.ratio = 1)
-  n <- paste0("tSNE_",top)
-  gg.list[[n]] <- gg
-}
-rm(Xvar,Xt,X,perplex,top,select,gg,ggtsne,tsne,pca,percentVar,n)
-# Plotting
-pdf(file = paste0("Plots/",substance,"_PCA_tSNE.pdf"),
-    width = 22,       
-    height = 10,
-    onefile = T,           #multiple figures in one file
-    #title = "",
-    #paper = "a4r",         #a4r = landscape DinA4 (r=rotated)
-    bg = "transparent", #Background color
-    fg ="black"         #Foreground color
-)
-print(ggpubr::ggarrange(plotlist = gg.list[c(1,3,5,7,2,4,6,8)], ncol = 4, nrow =2))
-dev.off()
-rm(gg.list)
+## Append qvalue to res.ls / resLfs.ls -----------------------------------------
+message("\nCalculating and appending qvalues to DESeq2 results ...")
+# res.ls
+res.ls = lapply(res.ls, function(x){
+  x$qval = qvalue(x$pvalue)$qvalue
+  x })
+# resLfs.ls
+resLfs.ls = lapply(resLfs.ls, function(x){
+  x$qval = qvalue(x$pvalue)$qvalue
+  x })
+message("Done!\n")
 ###################
 
-### Shiny DEG correlation plots ####
-# Plotting functions ----------------
-# Correlation
-corplot <- function(df){
-  z <- length(levels(as.factor(df$Type)))
-  ggplot(df, aes(x=LFC_HE, y=LFC_LE, color = Type)) +
-    geom_point(size = 3, alpha = .4, shape = 16) +
-    geom_point(data = df[which(df$Type %in% 'DEG Overlap'),], #2nd layer
-               aes(x=LFC_HE, y=LFC_LE),
-               shape = 16, size = 3, alpha = .5) +
-    labs(title = paste0(substance," - DEG correlation"), 
-         subtitle = paste(name,"vs", name.HE), 
-         x = paste0('Log2FC (Control vs ',tail(resNames,1),")"), 
-         y = paste0('Log2FC (Control vs ',k,")")) +
-    geom_hline(yintercept = 0, linetype = "dashed", alpha = .4) +
-    geom_vline(xintercept = 0, linetype = "dashed", alpha = .4) +
-    theme_bw() + coord_equal(ratio=1) + 
-    theme(aspect.ratio = 1, legend.position = 'bottom') +
-    geom_rug(alpha = .5) +
-    #geom_point(aes(x=df[df$Type %in% "DEG Overlap","LFC_HE"], y=df[df$Type %in% "DEG Overlap","LFC_LE"]), color="black") +
-    #scale_colour_manual(values=c("dodgerblue2","darkgreen","red3")) #not really color blind friendly!
-    #scale_shape_manual(values=c(15, 17, 16)) +
-    #scale_colour_brewer(palette = "Dark2")+
-    scale_colour_manual(values = if(z < 3){c("mediumblue","red2")}else{c("deepskyblue1","mediumblue","red2")})+
-    #scale_colour_manual(values=c("gold1","darkorange1","red2"))+
-    annotate("label",
-             label = paste0("Pearson Cor = ",round(cor(df[df$Type %in% "DEG Overlap","LFC_HE"],df[df$Type %in% "DEG Overlap","LFC_LE"]),2)),
-             color = "red2",
-             x = (min(df$LFC_HE)), 
-             y = (max(df$LFC_LE)),
-             hjust=0, vjust=.3) + 
-    annotate("label",
-             label = paste0("Pearson Cor = ",round(cor(df$LFC_HE,df$LFC_LE),2)),
-             x = (min(df$LFC_HE)), 
-             y = (max(df$LFC_LE)-.45),
-             hjust=0, vjust=.3) + 
-    annotate("label",
-             label = paste0("R2 = ",round(cor(df$LFC_HE,df$LFC_LE)^2,2)),
-             x = (max(df$LFC_HE)), 
-             y = (min(df$LFC_LE)),
-             hjust=.75, vjust=0)+
-    annotate("label",
-             label = paste0("R2 = ",round(cor(df[df$Type %in% "DEG Overlap","LFC_HE"],df[df$Type %in% "DEG Overlap","LFC_LE"])^2,2)),
-             color = "red2",
-             x = (max(df$LFC_HE)), 
-             y = (min(df$LFC_LE)+.45),
-             hjust=.75, vjust=0)
-}
-# Venn Diagrams 
-# venn.ls: List object containing gene IDs to plot Venn with
-venplot <- function(venn.ls){plot(eulerr::euler(venn.ls,shape="ellipse",lty = 0),
-                                  fills = list(fill = c("deepskyblue1","mediumblue"), alpha = .7),
-                                  labels = list(col = "black", font = 4),
-                                  #legend = list(col = "black", font = 4),
-                                  quantities = TRUE, #to display values
-                                  main = paste0(" [padj <",p,"; Stress: ",round(eulerr::euler(venn.ls,shape="ellipse")$stress,4),"; DiagError: ",round(eulerr::euler(venn.ls,shape="ellipse")$diagError,3),"]"))
-}
-# Plotting --------------------------
-message(" 
- Start shiny DEG Correlation plotting ...")
-pdf(file = paste0("Plots/",substance,"_DEG_cor.pdf"), onefile = T, bg = "transparent", #Background color
-    width = 8*(length(resNames)-1), height = 14)
 
-gg.list <- list() #empty list for storing plotting objects
-# res
-for(k in resNames[1:length(resNames)-1]){
-  name <- paste0("res.",k)
-  res <- get(name)
-  name.HE <- paste0("res.",tail(resNames,1))
-  res.HE <- get(name.HE) # Get highest exposure results
-  
-  LE <- setdiff(rownames(subset(res, padj <= p)),rownames(subset(res.HE, padj <= p))) #genes present in res and not in res.HE
-  HE <- setdiff(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p)))
-  Ov <- intersect(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p))) # Ov = overlap
-  
-  if(length(LE)!=0){
-    df.LE <- data.frame(GeneID = LE, Type = "DEG in LE")
-  }else{df.LE <- NULL}
-  if(length(HE)!=0){
-    df.HE <- data.frame(GeneID = HE, Type = "DEG in HE")
-  }else{df.HE <- NULL}
-  if(length(Ov)!=0){
-    df.Ov <- data.frame(GeneID = Ov, Type = "DEG Overlap")
-  }else{df.Ov <- NULL}
-  
-  df <- as.data.frame(rbind(df.LE,df.HE,df.Ov))
-  rownames(df) <- df$GeneID
-  df <- df[stringr::str_order(df$GeneID),]
-  
-  if (nrow(df) > 2){
-    # Append LFC for HE and LE to df (there is propably an easier way to write this but can't figure it out... works for now)
-    # HE
-    res1 <- get(paste0("res.",tail(resNames,1))) 
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice! 
-    # Append HE LFC values
-    df$LFC_HE <- df1$log2FoldChange
-    
-    # LE
-    res1 <- get(paste0("res.",k))
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice!
-    # Append HE LFC values
-    df$LFC_LE <- df1$log2FoldChange
-    
-    ## DEG Correlation plot
-    gg <- corplot(df)
-    gg.list[[paste0(k,".cor")]] <- gg
-    
-    ## Venn plot
-    venn.ls <- list(LE = rownames(subset(res, padj <= p)),
-                    HE = rownames(subset(res.HE, padj <= p)))
-    gg <- venplot(venn.ls)
-    gg.list[[paste0(k,".ven")]] <- gg
-  }else{message(paste0(" Number of DEGs < 3 for: ",name," vs ",name.HE,"
- Skipped Correlation plotting"))}
-}
-if (nrow(df) > 2){
-  # objects in gglist
-  ggobj <- ls(gg.list)
-  x <- ggobj[c(T, F)] #cor plots
-  y <- ggobj[c(F, T)] #venn plots
-  print(ggpubr::ggarrange(plotlist = gg.list[c(x,y)], ncol = length(resNames)-1, nrow =2))
+###################
+###   biomaRt   ###
+###################
+## Create annotation object for DESeq2 result tables ---------------------------
+message("\nAnnotating ENSEMBL Gene IDs in result tables using biomaRt ...")
+# if rerio mart object found locally load it, create new mart object from host 
+if(file.exists("~/biomaRt/drerio_mart.Robj")) {
+  message("\nDanio rerio mart object found locally. \nLoading 'drerio_mart.Robj' into R session ...")
+  load("~/biomaRt/drerio_mart.Robj")
+} else if (file.exists("S:/data/biomaRt/drerio_mart.Robj")){
+  message("\nDanio rerio mart object found in S:/data/biomaRt/ \nLoading 'drerio_mart.Robj' into R session ...")
+  load("S:/data/biomaRt/drerio_mart.Robj")
+} else {
+  message("\nCould not find 'drerio_mart.Robj'. Creting new mart object from 'www.ensembl.org'",
+          "\nMake sure you have a working interent connection. Otherwise this will fail!\nConnecting to server ...")
+  rerio = biomaRt::useMart("ENSEMBL_MART_ENSEMBL",dataset="drerio_gene_ensembl",host="https://www.ensembl.org")
 }
 
-# res.LFcut #
-for(k in resNames[1:length(resNames)-1]){
-  name <- paste0("res.",k,".LFcut")
-  res <- get(name)
-  name.HE <- paste0("res.",tail(resNames,1),".LFcut")
-  res.HE <- get(name.HE) # Get highest exposure results
-  
-  LE <- setdiff(rownames(subset(res, padj <= p)),rownames(subset(res.HE, padj <= p))) #genes present in res and not in res.HE
-  HE <- setdiff(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p)))
-  Ov <- intersect(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p))) # Ov = overlap
-  
-  if(length(LE)!=0){
-    df.LE <- data.frame(GeneID = LE, Type = "DEG in LE")
-  }else{df.LE <- NULL}
-  if(length(HE)!=0){
-    df.HE <- data.frame(GeneID = HE, Type = "DEG in HE")
-  }else{df.HE <- NULL}
-  if(length(Ov)!=0){
-    df.Ov <- data.frame(GeneID = Ov, Type = "DEG Overlap")
-  }else{df.Ov <- NULL}
-  
-  df <- as.data.frame(rbind(df.LE,df.HE,df.Ov))
-  rownames(df) <- df$GeneID
-  df <- df[stringr::str_order(df$GeneID),]
-  
-  if (nrow(df) > 2){
-    # Append LFC for HE and LE to df (there is propably an easier way to write this but can't figure it out... works for now)
-    # HE
-    res1 <- get(paste0("res.",tail(resNames,1))) 
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice! 
-    # Append HE LFC values
-    df$LFC_HE <- df1$log2FoldChange
-    
-    # LE
-    res1 <- get(paste0("res.",k))
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice!
-    # Append HE LFC values
-    df$LFC_LE <- df1$log2FoldChange
-    
-    ## DEG Correlation plot
-    gg <- corplot(df)
-    gg.list[[paste0(k,".cor")]] <- gg
-    
-    ## Venn plot
-    venn.ls <- list(LE = rownames(subset(res, padj <= p)),
-                    HE = rownames(subset(res.HE, padj <= p)))
-    gg <- venplot(venn.ls)
-    gg.list[[paste0(k,".ven")]] <- gg
-  }else{message(paste0(" Number of DEGs < 3 for: ",name," vs ",name.HE,"
- Skipped Correlation plotting"))}
+## Build gene annotation object & merge ----------------------------------------
+id     = rownames(res.ls[[1]])
+idType = "ensembl_gene_id"
+attr   = c("ensembl_gene_id","external_gene_name","description","gene_biotype",
+           "entrezgene_id")
+message("\nAnnotating Ensembl gene IDs ...")
+GeneAnno = biomaRt::getBM(attributes = attr, mart = rerio, uniqueRows = F,
+                          filters = idType, values = id, useCache = F)
+stopifnot(length(intersect(GeneAnno$ensembl_gene_id,id)) == length(id)) #Check Sum
+
+# !!! In a few cases there can be more than one entrez id for a single ensembl gene id !!!
+# Here we remove duplicated entries (~ 360 out of ~ 25 000, so it's really a minor fraction)
+# As it turns out higher integer values in the entrez ID correspond to a deeper level of organization
+# i.e. ID 999 -> Protein A, ID 1000348 -> Protein A subunit a1. For our purpose it is good enough 
+# to retrieve the overall gene / protein information.
+# => We sort GeneAnno by entrezgene_id and then remove the duplicates with !duplicate().
+# That way, in case multiple entrez ids are assigned to a single ensembl id the lower entrez id
+# will be kept for downstream analysis. 
+GeneAnno = dplyr::arrange(GeneAnno, entrezgene_id)
+GeneAnno = GeneAnno[!duplicated(GeneAnno$ensembl_gene_id),] #keep only non duplicated
+stopifnot(length(id) == nrow(GeneAnno)) #Check Sum
+row.names(GeneAnno) = GeneAnno$ensembl_gene_id
+# To ensure compatability with downstream GSEA scripts rename external_gene_name & entrezgene_id
+colnames(GeneAnno) = c("ensembl_gene_id","SYMBOL","description","biotype","ENTREZID")
+
+# Now merge GeneAnno with DESeq2 result tables
+AnnoFun = function(x){
+  tmp = merge(as.data.frame(x), GeneAnno, by=0)[,-1]
+  row.names(tmp) = tmp$ensembl_gene_id
+  tmp[,-which(colnames(tmp) %in% "ensembl_gene_id")]
 }
-if (nrow(df) > 2){
-  # objects in gglist
-  ggobj <- ls(gg.list)
-  x <- ggobj[c(T, F)] #cor plots
-  y <- ggobj[c(F, T)] #venn plots
-  print(ggpubr::ggarrange(plotlist = gg.list[c(x,y)], ncol = length(resNames)-1, nrow =2))
+res.ls    = lapply(res.ls, FUN = AnnoFun)
+resLfs.ls = lapply(resLfs.ls, FUN = AnnoFun)
+# Finally sort res.ls / resLfs.ls after the padj value
+res.ls    = lapply(res.ls, function(x){dplyr::arrange(x, padj)})
+resLfs.ls = lapply(resLfs.ls, function(x){dplyr::arrange(x, padj)})
+rm(id, rerio)
+message("Done!\n")
+###################
+
+
+###  EXPORT DESeq2 RESULTS  ### -------------------------------------------------------
+message("Exporting DESeq2 result tables. This might take a while :)")
+dir.create("Results", showWarnings = F)
+for(k in names(res.ls)){
+  n = gsub("[Ee]xposure","",k)
+  message(paste("Saving DESeq2 result table",k,"[IHW, non-shrunk Log2FC] to csv ..."))
+  write.csv2(res.ls[[k]], file = paste0("Results/",substance,"_res_",n,".csv"))
+  message(paste("Saving DESeq2 result table",k,"[IHW, apeglm shrunk Log2FC] to csv ..."))
+  write.csv2(resLfs.ls[[k]], file = paste0("Results/",substance,"_reslfs_",n,".csv"))
+}
+message("Done!\n")
+
+## Select only DEGs for export and downstream plotting ##
+deg.ls    <- lapply(res.ls, function(x){subset(x, padj <= p)}) # pcut
+degCut.ls <- lapply(res.ls, function(X){                       # pcut & log2FC cutoff 
+  lfcut = quantile(abs(X$log2FoldChange), Qt) #(90% quantile of abs(log2FC))
+  if(lfcut > 1){lfcut = 1} # in case lfcut greater 1, set to 1
+  x = subset(X, padj <= p)
+  subset(x, abs(log2FoldChange) >= lfcut)
+})
+# Selecting only DEGs with padj < p & abs(apeglm shrunk Log2FC) > lfcut (90% quantile from abs(non shrunk log2FC))
+degLfs.ls = list()
+for(k in names(resLfs.ls)){
+  # determine lfc cut off based on non-shrunk values
+  lfcut = quantile(abs(res.ls[[k]]$log2FoldChange), Qt)
+  if(lfcut > 1){lfcut = 1} # in case lfcut greater 1, set to 1
+  message(paste("Log2FC cut off for:\t",k,"\t----->\t",round(lfcut,2),"(Top",(1-Qt)*100,"% Quantile)"))
+  # Select padj < p from resLfs.ls and subset by log2FC
+  degLfs.ls[[k]] <- subset(subset(resLfs.ls[[k]], padj <= p), abs(log2FoldChange) >= lfcut)
 }
 
-# reslfs
-for(k in resNames[1:length(resNames)-1]){
-  name <- paste0("reslfs.",k)
-  res <- get(name)
-  name.HE <- paste0("reslfs.",tail(resNames,1))
-  res.HE <- get(name.HE) # Get highest exposure results
-  
-  LE <- setdiff(rownames(subset(res, padj <= p)),rownames(subset(res.HE, padj <= p))) #genes present in res and not in res.HE
-  HE <- setdiff(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p)))
-  Ov <- intersect(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p))) # Ov = overlap
-  
-  if(length(LE)!=0){
-    df.LE <- data.frame(GeneID = LE, Type = "DEG in LE")
-  }else{df.LE <- NULL}
-  if(length(HE)!=0){
-    df.HE <- data.frame(GeneID = HE, Type = "DEG in HE")
-  }else{df.HE <- NULL}
-  if(length(Ov)!=0){
-    df.Ov <- data.frame(GeneID = Ov, Type = "DEG Overlap")
-  }else{df.Ov <- NULL}
-  
-  df <- as.data.frame(rbind(df.LE,df.HE,df.Ov))
-  rownames(df) <- df$GeneID
-  df <- df[stringr::str_order(df$GeneID),]
-  
-  if (nrow(df) > 2){
-    # Append LFC for HE and LE to df (there is propably an easier way to write this but can't figure it out... works for now)
-    # HE
-    res1 <- get(paste0("res.",tail(resNames,1))) 
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice! 
-    # Append HE LFC values
-    df$LFC_HE <- df1$log2FoldChange
-    
-    # LE
-    res1 <- get(paste0("res.",k))
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice!
-    # Append HE LFC values
-    df$LFC_LE <- df1$log2FoldChange
-    
-    ## DEG Correlation plot
-    gg <- corplot(df)
-    gg.list[[paste0(k,".cor")]] <- gg
-    
-    ## Venn plot
-    venn.ls <- list(LE = rownames(subset(res, padj <= p)),
-                    HE = rownames(subset(res.HE, padj <= p)))
-    gg <- venplot(venn.ls)
-    gg.list[[paste0(k,".ven")]] <- gg
-  }else{message(paste0(" Number of DEGs < 3 for: ",name," vs ",name.HE,"
- Skipped Correlation plotting"))}
+## Exporting DEGs in separate result csv tables ##
+dir.create("DEGs", showWarnings = F)
+out = c("unshrink","unshrinkFCcut","lfsFCcut") # output dir. for different levels of filtering
+for(k in out){dir.create(paste0("DEGs/",k), showWarnings = F)}
+# Export to respective dir
+for(k in names(deg.ls)) {
+  message(paste("Saving selection of DEGs for",k,"to csv ..."))
+  n = gsub("[Ee]xposure","",k)
+  write.csv2(deg.ls[[k]],paste0("DEGs/",out[1],"/",substance,"_pcut_",n,".csv"))   # unshrink
+  write.csv2(degCut.ls[[k]],paste0("DEGs/",out[2],"/",substance,"_pcut_LFcut_",n,".csv"))# unshrink + FCcut
+  write.csv2(degLfs.ls[[k]],paste0("DEGs/",out[3],"/",substance,"_lfs_pcut_LFcut_",n,".csv"))# shrink + FCcut
 }
-if (nrow(df) > 2){
-  # objects in gglist
-  ggobj <- ls(gg.list)
-  x <- ggobj[c(T, F)] #cor plots
-  y <- ggobj[c(F, T)] #venn plots
-  print(ggpubr::ggarrange(plotlist = gg.list[c(x,y)], ncol = length(resNames)-1, nrow =2))
-}
+message("Done!\n")
+rm(n,k,lfcut,out)
+###############################
 
-# reslfs.LFcut
-for(k in resNames[1:length(resNames)-1]){
-  name <- paste0("reslfs.",k,".LFcut")
-  res <- get(name)
-  name.HE <- paste0("reslfs.",tail(resNames,1),".LFcut")
-  res.HE <- get(name.HE) # Get highest exposure results
+
+######################################   PLOTTING   ##########################################
+dir.create(paste0(home,"/Plots"), showWarnings = F)
+dir.create(paste0(home,"/Plots/DataQC"), showWarnings = F)
+message("\nStarting Data Composition and QC plotting ...")
+
+### QC - DESeq2 norm. & count distr. & countMtx filtering  ### -----------
+message("DESeq2 normalization & gene count distribution ...")
+while (!is.null(dev.list()))  dev.off()
+pdf(file = paste0("Plots/DataQC/",substance,"_CountNorm_mtxFiltering.pdf"),
+    width = 9, height = 11.7)
+par(mfrow=c(4,2))
+
+## Normalization bar plots ##
+barplot(colSums(counts(dds)),
+        ylab= "Total gene counts",
+        main= "Raw counts",
+        las= 3, #rotating sample labels 90
+        ylim= c(0,1.2*max(colSums(counts(dds)))))
+barplot(colSums(counts(dds, normalized=T)),  #plot mean normalized counts
+        ylab= "Total gene counts",
+        main= "DESeq2 norm. counts",
+        las= 3, #rotating sample labels 90
+        ylim= c(0,1.2*max(colSums(counts(dds)))))
+boxplot(log10(counts(dds)+1),
+        ylab= "Log10(Gene counts + 1)",
+        las = 3, #rotating sample labels 90
+        main= "Raw counts")
+boxplot(log10(counts(dds, normalized=T)+1),
+        ylab= "Log10(Gene counts + 1)",
+        las = 3, #rotating sample labels 90
+        main= "DESeq2 norm. counts")
+
+## Gene count distr. & countMtx filtering ##
+cut = ncol(count.matrix) # min counts per row
+# quantile distribution of gene count matrix row sums
+tmp = apply(count.matrix, 1, sum)
+tmp = quantile(log10(tmp+1), probs = seq(0, 1, .05))
+tmp = data.frame(x=seq(0,1,.05)*100, y=tmp)
+plot(tmp, xlab = "Quantile-%", ylab = "log10(gene row sum + 1)", main = "Gene row sum quantile distribution - Deprecated, do not use")
+abline(h = log10(cut+1), lwd=1.5, lty=2, col = "firebrick")
+text(x = 0, y = log10(cut+1)*1.3, pos = 4, offset = 0.5,labels = paste("Cutoff:",cut))
+
+# rowsum cutoff vs remaining number of genes in count matrix
+cutOffPlot <- function(countMtx, cut) {
+  n = ncol(countMtx)
+  if(missing(cut)){cut = n}
+  if(n < 6) {stop("Number of count matrix columns < 6")}
+  X = seq(n-6,n+50,1) 
+  X[X == 0] <- 1
+  X = sort(union(X, c(1:5)))
   
-  LE <- setdiff(rownames(subset(res, padj <= p)),rownames(subset(res.HE, padj <= p))) #genes present in res and not in res.HE
-  HE <- setdiff(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p)))
-  Ov <- intersect(rownames(subset(res.HE, padj <= p)),rownames(subset(res, padj <= p))) # Ov = overlap
-  
-  if(length(LE)!=0){
-    df.LE <- data.frame(GeneID = LE, Type = "DEG in LE")
-  }else{df.LE <- NULL}
-  if(length(HE)!=0){
-    df.HE <- data.frame(GeneID = HE, Type = "DEG in HE")
-  }else{df.HE <- NULL}
-  if(length(Ov)!=0){
-    df.Ov <- data.frame(GeneID = Ov, Type = "DEG Overlap")
-  }else{df.Ov <- NULL}
-  
-  df <- as.data.frame(rbind(df.LE,df.HE,df.Ov))
-  rownames(df) <- df$GeneID
-  df <- df[stringr::str_order(df$GeneID),]
-  
-  if (nrow(df) > 2){
-    # Append LFC for HE and LE to df (there is propably an easier way to write this but can't figure it out... works for now)
-    # HE
-    res1 <- get(paste0("res.",tail(resNames,1))) 
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice! 
-    # Append HE LFC values
-    df$LFC_HE <- df1$log2FoldChange
-    
-    # LE
-    res1 <- get(paste0("res.",k))
-    x <- which(rownames(res1) %in% df$GeneID == T) # Get position of the genes listed in df
-    df1 <- res1[rownames(res1) %in% rownames(df),]
-    df1 <- df1[stringr::str_order(rownames(df1)),]
-    # Check if everything is correct 
-    stopifnot(all(rownames(df1) == df$GeneID)) #Nice!
-    # Append HE LFC values
-    df$LFC_LE <- df1$log2FoldChange
-    
-    ## DEG Correlation plot
-    gg <- corplot(df)
-    gg.list[[paste0(k,".cor")]] <- gg
-    
-    ## Venn plot
-    venn.ls <- list(LE = rownames(subset(res, padj <= p)),
-                    HE = rownames(subset(res.HE, padj <= p)))
-    gg <- venplot(venn.ls)
-    gg.list[[paste0(k,".ven")]] <- gg
-  }else{message(paste0(" Number of DEGs < 3 for: ",name," vs ",name.HE,"
- Skipped Correlation plotting"))}
+  rNbr = c() # empty vector to store Nbr of genes per cutoff in
+  for(x in X) {
+    tmp  = nrow(countMtx[which(rowSums(countMtx) >= x), ])
+    rNbr = append(rNbr, tmp)
+  }
+  df <- data.frame(x = X, y = rNbr)
+  plot(df, xlab = "Row sum cut off", ylab = "Nbr of genes",
+       main = "Genes in count matrix - Deprecated, do not use")
+  abline(v=cut, lwd=1.5, lty=2, col = "firebrick")
+  #abline(h=df[cut,2], lwd=1.5, lty=2, col = "blue")
+  text(x = cut, y = df[cut,2], pos = 4, offset = 1.5,
+       labels = paste("Cutoff:",cut,"=",df[cut,2],"genes"))
 }
-if (nrow(df) > 2){
-  # objects in gglist
-  ggobj <- ls(gg.list)
-  x <- ggobj[c(T, F)] #cor plots
-  y <- ggobj[c(F, T)] #venn plots
-  print(ggpubr::ggarrange(plotlist = gg.list[c(x,y)], ncol = length(resNames)-1, nrow =2))
+cutOffPlot(count.matrix, cut)
+
+# gene count distribution before AND after row sum cutoff (based on on row means)
+tmp  = apply(count.matrix,1,mean)
+tmp1 = apply(count.matrix.cl, 1, mean)
+hist(log2(tmp+1), breaks = 40, main = "countMtx", 
+     ylim = c(0,2500), xlim = c(0,20),
+     xlab = "log2(Row mean count +1)")
+hist(log2(tmp1 +1), breaks = 40, main = paste("filtered countMtx - min. CPM:", minCPM, "in", perc, "of one condition:"),
+     ylim = c(0,2500), xlim = c(0,20),
+     xlab ="log2(Row mean count +1)") #histogram of filtered counts
+
+dev.off()
+rm(cut,tmp, tmp1)
+##############################################################
+
+### QC - DESeq2's dispersion estimate models ### ---------------------------------------------
+message("DESeq2's dispersion estimate models (estimateDispersions) ...")
+while (!is.null(dev.list()))  dev.off()
+pdf(file = paste0("Plots/DataQC/",substance,"_DispEstimates.pdf"),
+    width = 7, height = 5.9, onefile = T, bg = "transparent")
+for(i in names(estDisp.ls)){
+  plotDispEsts(estDisp.ls[[i]], main = paste(substance,'- DESeq2 fit type:',i))
 }
 dev.off()
+rm(estDisp.ls, i)
+gc() #free some memory 
+################################################
+
+### QC - pvalue and LFC distribution ### -----------------------------------------------------
+message("pvalue and LFC distribution ...")
 while (!is.null(dev.list()))  dev.off()
-rm(x,y,ggobj,gg.list,venn.ls,df,df1,res,res1,res.HE,gg,df.LE,df.HE,df.Ov,LE,HE,Ov,name,name.HE)
-###################################
-
-### HEATMAPS of potential Biomarkers #####
-# Plot heatmap with potential biomarkers genes
-# Hence genes in the overlap between HE & LE
-# if there are more than 2 treatment conditions. Take the overlap from 
-# the highest treatment with the second highest for a heatmap;
-# then the third highest and so on ...
-## center rlog mean counts around the control's mean and scale for the gene's SD -----
-centerForMean <- function(df){
-  coldat <- coldata[colnames(df),]
-  id <- rownames(coldat[coldat$Condition %in% 'Control',])
-  ctrM <- apply(df[,id], 1, FUN = mean) #calcs the mean of control
-  Sd <- apply(df, 1, FUN = sd) # calcs Sd of each row / gene
-  (df - ctrM)/Sd # centers for the mean of control and scales for overall Sd of the row / gene
+n = length(condition)-1
+pdf(file = paste0("Plots/DataQC/",substance,"_pvalue_LFC_distr.pdf"),
+    width = 3*n, height = 13.33, onefile = T, bg = "transparent")
+#png(filename = paste0("Plots/DataQC/",substance,"_pvalue_LFC_distr.png"),
+#    width = 6*n, height = 18, units = "cm", bg = "white", pointsize = 7, res = 450)
+par(mfrow=c(4,n))
+## pval distr
+for(i in names(res.ls)){
+  hist(res.ls[[i]]$pvalue, main= paste(substance,i),col = "gray50", 
+       border = "gray50", xlab = "p-value", breaks = 40)
 }
-scaled.rld <- centerForMean(df.rld) #mean centered df for heatmap
-## resort column order ---------------------------------------------------------------
-id.order <- c()
-for(i in levels(as.factor(coldata$Substance))){
-  for(k in levels(as.factor(coldata$Condition))){
-    id <- rownames(coldata[coldata$Condition %in% k & coldata$Substance %in% i,])
-    id.order <- append(id.order,id)
-  }
+## pval vs padj & qval
+pVSpadjPlot <- function(res, pval=.05, q=.05, p=.05, title = ""){
+  plot(res$pvalue, res$padj, xlab="pvalue", ylab="conversion of pvalue",
+       xlim= c(0,0.25), ylim = c(0,1), main= paste(substance,title),
+       col = "dodgerblue1",pch = 20)
+  points(res$pvalue, res$qval, col="springgreen3", pch = 20)
+  abline(h=p, lwd=1, lty=2)
+  abline(v=pval, lwd=1, lty=2)
+  xpos <- 0.1
+  text(x = .25, y = .2, pos = 2, offset = 0, col = "black",
+       labels = paste("Genes with pvalue <",pval,":\t",sum(res$pvalue <= pval, na.rm = T)))
+  text(x = .25, y = .15, pos = 2, offset = 0, col = "springgreen3",
+       labels = paste("Genes with Qvalue <",q,":\t",sum(res$qval <= q, na.rm = T)))
+  text(x = .25, y = .1, pos = 2, offset = 0, col = "dodgerblue",
+       labels = paste("Genes with padj (BH) <",p,":\t",sum(res$padj <= p, na.rm = T)))
 }
-scaled.rld <- scaled.rld[,id.order]
-
-## Get list of DE genes --------------------------------------------------------------
-# non-shrunk
-DEG <- list()
-for (k in resNames){
-  obj <- paste0("res.",k,".LFcut") # use this line to collect non-lfs LFcut DE genes
-  x <- get(obj)
-  x <- rownames(x[x$padj <= p,])
-  DEG[[k]] <- x
+for(i in names(res.ls)) { pVSpadjPlot(res.ls[[i]], title = i) }
+## Log2FC distr.
+lfcDistPlot <- function(res, q=Qt, LFcut=quantile(abs(res$log2FoldChange),q), 
+                        title="", Ylim = c(0,2000), xlab="Log2(fc)") {
+  m = max(abs(res$log2FoldChange))
+  if(m > 5){m = 5}
+  hist(res$log2FoldChange, breaks= 500, main= paste(substance,title), col= "gray50",
+       border= "gray50", xlab=xlab, xlim= c(-m, m), ylim = Ylim)
+  abline(v= c(LFcut,-LFcut), col= "dodgerblue", lty= 2, lwd= 1)
+  legend(x="topright", text.col = "dodgerblue", bty = "n",
+         legend = paste0("LFcut: +/-",round(LFcut, digits = 2),
+                         "\n",(1-q)*100,"% Quantile"))
 }
-# apeglm shrunk
-DEGlfs <- list()
-for (k in resNames){
-  obj <- paste0("reslfs.",k,".LFcut")
-  x <- get(obj)
-  x <- rownames(x[x$padj <= p,])
-  DEGlfs[[k]] <- x
+for(i in names(res.ls)) { lfcDistPlot(res.ls[[i]], title = i) }
+for(i in names(res.ls)) {
+  lfcut = quantile(abs(res.ls[[i]]$log2FoldChange),Qt)
+  lfcDistPlot(resLfs.ls[[i]], title = i, LFcut = lfcut, Ylim = c(0,200), xlab = "apgelm(lfc)")
 }
-# Get a list of potential biomarkers from overlaps between conditions
-biomarker.ls <- list() # use this biomarker.ls as input for heatmap loop 
-var <- length(resNames)
-for (i in 1:(var-1)){
-  # non shrunk
-  name <- paste0(resNames[var],'.',resNames[i])
-  biomarker.ls[[name]] <- intersect(DEG[[resNames[var]]],DEG[[resNames[i]]])
-  # apeglm shrunk
-  name <- paste0(resNames[var],'.',resNames[i],'.lfs')
-  biomarker.ls[[name]] <- intersect(DEGlfs[[resNames[var]]],DEGlfs[[resNames[i]]])
-  rm(name,obj,x)
-}
-
-## Create df with gene Symbols to correctly annotate the heatmap -------------------
-# rowdata annotation file for heatmap with gene SYMBOLs
-ref <- as.data.frame(subset(get(paste0('res.',resNames[1])), select = c('SYMBOL'))) #contains all ENSEMBL IDs
-ref$GeneID <- as.factor(rownames(ref))
-ref$SYMBOL <- factor(ref$SYMBOL)
-# replace NAs in ref$SYMBOL with ENSEMBL IDs
-#1) Add missing factor levels
-Id <- rownames(ref[which(is.na(ref$SYMBOL)),]) # ENSEMBL IDs of missing SYMBOLs
-levels <- levels(as.factor(ref$SYMBOL))
-for (i in c(1:length(Id))){
-  levels[length(levels) + 1] <- Id[i]
-}
-ref$SYMBOL <- factor(ref$SYMBOL, levels = levels)
-#2) replace NAs in ref$SYMBOL with ENSEMBL ID
-ref[is.na(ref),'SYMBOL'] <- rownames(ref[which(is.na(ref$SYMBOL)),])
-# length of levels should be = to nrow(ref); BUT can't be as multiple Gene IDs are assigned to a single Symbol
-#length(levels) == nrow(ref)
-# Get non unique SYMBOLS
-#x <- ref[which(duplicated(ref$SYMBOL)),'SYMBOL']
-#x[which(!is.na(x))]
-#length(x[which(!is.na(x))])# many gene SYMBOLs not unique!!! 
-
-## Define heatmap function --------------------------------------------------------
-myheat2 <- function(df, colclust, rowclust, title, distM, Symbol){
-  # Set anno colors
-  Tanks <- levels(as.factor(coldata$Tank))
-  Conditions <- levels(as.factor(coldata$Condition))
-  col.Cond <- colorRampPalette(c('green',"gold1","indianred3"))(length(Conditions))
-  col.Tank <- colorRampPalette(c("gray95","gray50"))(length(Tanks))
-  ann_colors <- list(Condition = setNames(col.Cond, Conditions),
-                     Tank = setNames(col.Tank, Tanks))
-  colGaps <- c()
-  for(k in Conditions[1:(length(Conditions)-1)]){
-    x <- which(coldata[id.order,'Condition'] %in% k)
-    x <- tail(x,1)
-    colGaps <- append(colGaps,x)
-  }
-  # cluster fun
-  callback <- function(hc, mat){
-    sv = svd(t(mat))$v[,1]
-    dend = reorder(as.dendrogram(hc), wts = sv)
-    as.hclust(dend)
-  }
-  # set anno colors & breaks
-  x <- 80 #length of color palette
-  col <- colorRampPalette(c("mediumblue","white","red2"))(x) #defines color palette in heatmap
-  s <- sd(df[,rownames(coldata[which(coldata$Condition %in% 'Control'),])]) # sets sd around 0 values from control to white
-  m <- mean(df[,rownames(coldata[which(coldata$Condition %in% 'Control'),])])
-  myBreaks <- c(seq(min(df), m-s, length.out=ceiling(x/2) + 1), 
-                seq(m+s, max(df), length.out=floor(x/2)))
-  # plot
-  if(missing(colclust)){colclust = F}
-  if(missing(rowclust)){rowclust = T}
-  if(missing(distM)){distM = 'euclidean'} # euclidean, maximum, manhattan, ... 
-  if(missing(title)){title = ''}
-  if(missing(Symbol)){Symbol = F}
-  if(Symbol == T){
-    df1 <- df
-    ref1 <- ref[row.names(df),]
-    row.names(df1) <- ref1[row.names(ref1) %in% row.names(df),'SYMBOL']
-  }else{df1 <- df}
-  pheatmap::pheatmap(
-    df1,
-    angle_col = "90",
-    gaps_col = if(colclust == T){NULL}else{colGaps},
-    #cellwidth = 16,
-    #cellheight = if(length(bioM) > 190){2}else{8}, #6
-    clustering_callback = callback,
-    treeheight_col = 30, #default 50
-    border_color = NA, 
-    cluster_rows= rowclust,
-    cluster_cols= colclust,
-    clustering_distance_rows = distM,
-    clustering_distance_cols = distM, 
-    clustering_method = "average",
-    main = if(colclust == T){paste(title,'[mean cent]',distM)}else{paste(title,'[mean cent]')},
-    show_rownames= T, 
-    show_colnames = T,
-    breaks = myBreaks,
-    annotation_col = coldata[,c('Tank','Condition')],
-    annotation_colors = ann_colors,
-    color = col
-  )
-}
-## Heatmap plotting loop ------------------------------------------------------------------------
-#hist(as.data.frame(scaled.rld))
-message(" 
- Start mean count centered heatmapping  ...")
-for(k in names(biomarker.ls)){
-  filename <- paste0(substance,'_Heatmap_',k)
-  bioM <- biomarker.ls[[k]]
-  if(length(bioM) < 3){
-    message(paste0(
-      " Number of DEGs for ",k," < 3. No heatmap was drawn."
-    ))
-  }else{
-    title <- paste0(substance,': ',length(bioM),' DEG(',k,')')
-    pdf(file = paste0("Plots/Heatmaps/",filename,".pdf"), #print directly to pdf
-        width = 8, height = if(length(bioM) > 16){16}else{length(bioM)},
-        onefile = T, bg = "transparent")
-    myheat2(scaled.rld[bioM,], title=title)
-    myheat2(scaled.rld[bioM,], title=title , Symbol = T)
-    myheat2(scaled.rld[bioM,], title=title , colclust = T, distM = 'maximum')
-    myheat2(scaled.rld[bioM,], title=title , colclust = T, distM = 'maximum', Symbol = T)
-    dev.off()
-  }
-  while(!is.null(dev.list())) dev.off()
-  rm(filename,bioM,title)
-}
+dev.off()
+rm(n,i,lfcut)
 ########################################
 
-### LDA ...
-### PLS-DA ...
-### Random Forest ...
+### QC - Norm. gene count transformation ### -------------------------------------------------
+message("Norm. count matrix transformation ...")
+while (!is.null(dev.list()))  dev.off()
+pdf(file = paste0("Plots/DataQC/",substance,"_NormCount_Transformation.pdf"),
+    width = nrow(coldata)-2, height = 4, onefile = T, bg = "transparent")
+par(mfrow=c(1,3))
+boxplot(normMtx$norm , notch = TRUE,las = 3, #rotating sample labels 90
+        main = "Normalized read counts", ylab = "norm. read counts")
+boxplot(normMtx$ntd, notch = TRUE, las = 3, #rotating sample labels 90
+        main = "log2 Transformation", ylab = "log2 (norm. read counts + 1)")
+boxplot(normMtx$nrl.bl, notch = TRUE, las = 3, #rotating sample labels 90
+        main = "rlog Transformation", ylab = "rlog (norm. read counts)")
+dev.off()
+############################################
 
-### Clear Env.####
-rm(i,k,topgenes,xpos,dis)
+### QC - PearsonCor of biol. replicates ### ----------------------------------------------------
+message("Biological replicates correlation ...")
+# get all possible combinations of samples for each condition
+comb = lapply(id.ls, function(x){gtools::combinations(length(x),2,x)})
+# plot dim.
+w = nrow(comb[[1]])   #width
+h = length(condition) #height
+# plotting function
+corplot.1 = function(df, tmp, Lab="", title="") {
+  d  = densCols(df[,tmp[1]], df[,tmp[2]], colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))
+  ggplot(df) + geom_point(aes(df[,tmp[1]], df[,tmp[2]], col = d), size = .8, alpha = .4) +
+    labs(x=paste(Lab,tmp[1]),y=paste(Lab,tmp[2]),
+         subtitle = (paste0(title," [",coldata[tmp[1],"Tank"]," vs ",coldata[tmp[2],"Tank"],"]"))) +
+    annotate("text", label = paste0("Pearson: ",round(cor(df[,tmp[1]], df[,tmp[2]]),2)),
+             x = (max(df[,tmp[1]])), y = (min(df[,tmp[2]])), hjust=1, vjust=0) + 
+    annotate("text", label = paste0("R2: ",round((cor(df[,tmp[1]], df[,tmp[2]]))^2,2)),
+             x = (min(df[,tmp[1]])), y = (max(df[,tmp[2]])), hjust=0, vjust=1) +
+    scale_color_identity() + coord_equal(ratio=1) + theme_bw()
+}
+multiCorPlot = function(mtx, label="") {
+  gg.ls = list()
+  for(k in names(comb)){
+    x = comb[[k]]
+    for(i in 1:nrow(x)){
+      tmp = x[i,] #IDs to plot with
+      df = as.data.frame(mtx[ ,tmp])
+      gg.ls[[paste0(k,i)]] <- corplot.1(df, tmp, Lab = label,
+                                        title = gsub("[Ee]xposure","",k))
+    }
+  }
+  gg.ls
+}
+## log2 ##
+gg = multiCorPlot(normMtx$ntd, label = "log2(norm.counts)")
+while (!is.null(dev.list()))  dev.off()
+png(filename = paste0("Plots/DataQC/",substance,"_Correlation_log2.png"),
+    width = 6.33*w, height = 6.6*h, units = "cm", bg = "white", 
+    pointsize = .5, res = 350)
+print(ggpubr::ggarrange(plotlist = gg, ncol = w, nrow = h, 
+                        labels = LETTERS[1:length(gg)]))
+dev.off()
+## rlog ##
+gg = multiCorPlot(normMtx$nrl.bl, label = "rlog(norm.counts)")
+while (!is.null(dev.list()))  dev.off()
+png(filename = paste0("Plots/DataQC/",substance,"_Correlation_rlog.png"),
+    width = 6.33*w, height = 6.6*h, units = "cm", bg = "white", 
+    pointsize = .5, res = 350)
+print(ggpubr::ggarrange(plotlist = gg, ncol = w, nrow = h, 
+                        labels = LETTERS[1:length(gg)]))
+dev.off()
+# clear env
+rm(w,h,gg,comb)
+gc()
+###########################################
 
-message(paste0(" 
- Finished Wald's pairwise testing DESeq2 Analysis & Plotting.
- Saving DESeq2.RData ...
- "))
-save.image(paste0(getwd(),"/DESeq2.RData"))
-#load("Y:/Test RNAseq/DESeq2_Pairwise/DESeq2.RData")
-message(paste0(" DESeq2.RData saved under:
- ",getwd(),"/DESeq2.RData"))
+### QC - SD varriance plot ### -------------------------------------------------
+my_meanSdPlot <- function(normMtx){
+  sdp1 <- vsn::meanSdPlot(normMtx$norm, ranks = T, plot = F)
+  sdp1 <- sdp1$gg + ggtitle("Mean counts - Ranked")+scale_y_continuous(trans='log10')+ylab("sd (log scale)") +
+    theme_bw()
+  
+  sdp2 <- vsn::meanSdPlot(normMtx$ntd, ranks = T, plot = F)
+  sdp2 <- sdp2$gg + ggtitle("log2 (mean counts) - Ranked") +
+    theme_bw() #+ ylim(0,3)
+  
+  sdp3 <- vsn::meanSdPlot(normMtx$nrl.bl, ranks = T, plot = F)
+  sdp3 <- sdp3$gg + ggtitle("rlog (mean counts) - Ranked") +
+    theme_bw() #+ ylim(0,3)
+  
+  sdp1b <- vsn::meanSdPlot(normMtx$norm, ranks = F, plot = F) #original scale with ranks=F
+  sdp1b <- sdp1b$gg + ggtitle("Mean counts") +
+    theme_bw()
+  
+  sdp2b <- vsn::meanSdPlot(normMtx$ntd, ranks = F, plot = F) #original scale with ranks=F
+  sdp2b <- sdp2b$gg + ggtitle("log2 (mean counts)") +
+    theme_bw() #+ ylim(0,3)
+  
+  sdp3b <- vsn::meanSdPlot(normMtx$nrl.bl, ranks = F, plot = F) #original scale with ranks=F
+  sdp3b <- sdp3b$gg + ggtitle("rlog (mean counts)") + 
+    theme_bw()#+ ylim(0,3)
+  
+  print(ggarrange(sdp1, sdp2, sdp3, sdp1b, sdp2b, sdp3b,
+                  labels = c("A1", "B1", "C1","A2", "B2", "C2"),
+                  ncol = 3, nrow =2))
+}
 
-## Session Information ##
-sink(paste0("SessionInfo_",substance,".txt"))
+message("Plotting standard deviation composition ...")
+while (!is.null(dev.list()))  dev.off()
+pdf(file = paste0("Plots/DataQC/",substance,"_meanSD.pdf"), #print directly to pdf
+    width = 17, height = 9.6)
+my_meanSdPlot(normMtx)
+dev.off()
+message("Done!\n")
+##############################
+
+### Sample Distance Matrix ### --------------------------------------------------
+message("Sample distance matrix plotting ...")
+myDismtx <- function(mtx, method="euclidean", top=500, title="") {
+  if(nrow(mtx) < top){top <- nrow(mtx)}
+  message(paste0("Plotting Sample Dist for Var.Top:\t\t",top))
+  
+  # Subsetting the top genes with max variance
+  Xvar <- apply(mtx,1,var)
+  X <- t(mtx[names(sort(Xvar, decreasing = T)[1:top]),])
+  
+  # transpose input, calculate sample distance and create a distance matrix
+  sampleDist <- dist(X, method = method) #must be one of "euclidean", "maximum", "manhattan", "canberra", "binary" or "minkowski"
+  distMtx <- as.matrix(sampleDist)
+  #rownames(distMtx) <- paste(coldata$Condition, coldata$Tank, sep="-")
+  
+  # create annotation object for heatmap
+  ann_col <- subset(coldata, select = c("Condition"))#,"Substance"))
+  ann_row <- subset(coldata, select = c("Tank"))
+  #rownames(ann_row) <- paste(coldata$Mixture, coldata$BioReplicate, sep="-")
+  
+  colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(15)
+  pheatmap::pheatmap(distMtx, angle_col = "90", display_numbers = T,
+                     #treeheight_col = 40, #default 50
+                     #fontsize = 12, #default 10
+                     #fontsize_number = 0.7*12,
+                     #cellwidth = 26,
+                     #cellheight = 26,
+                     drop_levels = T,
+                     number_format = if(method == "manhattan"){"%1.0f"}else{"%.1f"},
+                     main = paste(title,"- Dist:",method,"- topVar:",top),
+                     clustering_distance_rows = sampleDist,
+                     clustering_distance_cols = sampleDist,
+                     annotation_col = ann_col, # Condition!
+                     annotation_row = ann_row, # Tank!
+                     annotation_colors = ann_colors,
+                     col = colors)
+}
+
+mtx    = normMtx$nrl.bl #Input for disMtx
+topVar = c(2500,5000,nrow(mtx)) # Number top N varying genes/proteins
+
+while(!is.null(dev.list()))  dev.off()
+pdf(file = paste0(home,"/Plots/",substance,"_SampleDistMtx.pdf"), width = 8, height = 6.5)
+for(dis in c("euclidean","canberra","manhattan")){
+  message(paste0("\nComputing Sample Dist with dist measure:\t",dis))
+  for(i in topVar){ myDismtx(mtx, method=dis, top=i, title=substance) }
+}
+dev.off()
+rm(i,dis,topVar,mtx)
+message("Done!\n")
+
+##############################
+
+### PCA & t-SNE ### -----------------------------------------------------------------
+message("PCA and t-SNE clustering ...")
+# Add other k-mean cluster related type => See ENSEMBL Course
+
+myPCA  <- function(mtx, pcaM = "svd", top = 500, title = "", IDlabs = F) {
+  if(nrow(mtx) < top){top <- nrow(mtx)}
+  message(paste0("Plotting PCA for ",title," Var.Top:\t\t\t",top))
+  
+  # Subsetting the top genes with max variance
+  Xvar <- apply(mtx,1,var)
+  X <- t(mtx[names(sort(Xvar, decreasing = T)[1:top]),])
+  pc <- pcaMethods::pca(X, method = pcaM, center = T, nPcs=2)
+  pcaDf <- merge(coldata, pcaMethods::scores(pc), by=0)
+  
+  g = ggplot(pcaDf, aes(PC1, PC2, colour = Condition, shape=Tank)) +
+    geom_point(size = 3, alpha = .65) + scale_colour_manual(values = ann_colors$Condition) +
+    ggtitle(paste0(title," - exVar: ",round(pc@R2cum[2]*100,1),"%; ",pcaM,"; Top:",pc@nVar)) +
+    xlab(paste0("PC1: ",round((pc@R2)[1]*100,1),"% variance")) +
+    ylab(paste0("PC2: ",round((pc@R2)[2]*100,1),"% variance")) + #stat_ellipse() +
+    theme_bw() + theme(aspect.ratio = 1, legend.position = "none") +
+    theme(axis.text = element_text(size = 12), axis.title = element_text(size = 12))
+  if(IDlabs == T){
+    return(g + ggrepel::geom_text_repel(aes(x=PC1, y=PC2, label=Row.names), nudge_x = .5, nudge_y = .5))
+  } else {
+    return(g)
+  }
+}
+mytSNE <- function(mtx, top = 500, title = "", IDlabs = F) {
+  if(nrow(mtx) < top){top <- nrow(mtx)}
+  message(paste0("Plotting t-SNE for ",title," Var.Top:\t\t\t",top))
+  
+  # Subsetting the top genes with max variance
+  Xvar <- apply(mtx,1,var)
+  X <- t(mtx[names(sort(Xvar, decreasing = T)[1:top]),])
+  
+  # perform Rtsne calc.
+  perplex = (nrow(X)-1)/3
+  set.seed(42) #to make results reproducable! 
+  tsne <- Rtsne::Rtsne(X, dims=2, initial_dims=nrow(X), check_duplicates=F, num_threads=2,
+                       pca = TRUE, perplexity = perplex, #(should not be bigger than 3 * perplexity < nrow(X) - 1, see details for interpretation)
+                       theta = 0.0, #Speed/accuracy trade-off (increase for less accuracy), set to 0.0 for exact TSNE (default: 0.5)
+                       partial_pca = F, #(requires the irlba package). This is faster for large input matrices (default: FALSE)
+                       max_iter = 10000, #number of iterations
+                       is_distance = FALSE, pca_center = TRUE, pca_scale = FALSE, verbose = F,
+                       normalize = F) #Default True; Set to F as DESeq's RLE norm was performed prior!
+  row.names(tsne$Y) <- row.names(X)
+  colnames(tsne$Y) <- c("tSNE_1","tSNE_2")
+  
+  # ggplot
+  ggtsne <- merge(coldata, tsne$Y, by=0)
+  g = ggplot(ggtsne) + geom_point(aes(x=tSNE_1, y=tSNE_2, color = Condition, shape = Tank), size=3, alpha = .7) +
+    ggtitle(paste(title,"; Top:",top)) + xlab('t-SNE 1') + ylab('t-SNE 2') +
+    scale_colour_manual(values = ann_colors$Condition) + theme_bw() + theme(aspect.ratio = 1)
+  if(IDlabs == T){
+    return(g + ggrepel::geom_text_repel(aes(x=tSNE_1, y=tSNE_2, label=Row.names), nudge_x = .5, nudge_y = .5))
+  } else {
+    return(g)
+  }
+}
+
+topVar = c(500,2000,10000,nrow(normMtx$nrl)) # Number top N varying genes/proteins
+gg = list() #to store plots in
+for(i in topVar){ # ref.norm - ref channel & global mean normalized
+  gg[[paste0("pca",i)]]  <- myPCA(normMtx$nrl.bl, top=i, title=paste(substance,"rlog[norm].bl"))
+  gg[[paste0("tsne",i)]] <- mytSNE(normMtx$nrl.bl, top=i, title=paste(substance,"rlog[norm].bl")) }
+gg1 = list() #to store plots in
+for(i in topVar){ # norm - only global mean normalized
+  gg1[[paste0("pca",i)]]  <- myPCA(normMtx$nrl, top=i, title=paste0(substance,"rlog[norm]"))
+  gg1[[paste0("tsne",i)]] <- mytSNE(normMtx$nrl, top=i, title=paste0(substance,"rlog[norm]")) }
+gg2 = list()
+for(i in topVar){
+  gg2[[paste0("pca",i)]]  <- myPCA(normMtx$nrl.bl, top=i, title=paste(substance,"rlog[norm].bl"), IDlabs=T)
+  gg2[[paste0("tsne",i)]] <- mytSNE(normMtx$nrl.bl, top=i, title=paste(substance,"rlog[norm].bl"), IDlabs=T) }
+gg3 = list()
+for(i in topVar){
+  gg3[[paste0("pca",i)]]  <- myPCA(normMtx$nrl, top=i, title=paste(substance,"rlog[norm]"), IDlabs=T)
+  gg3[[paste0("tsne",i)]] <- mytSNE(normMtx$nrl, top=i, title=paste(substance,"rlog[norm]"), IDlabs=T) }
+# Export to pdf
+while(!is.null(dev.list())) dev.off()
+pdf(file = paste0(home,"/Plots/",substance,"_PCA.tSNE.rlogNormCounts.pdf"),
+    width = 12, height = length(topVar)*4.2 )
+print(ggpubr::ggarrange(plotlist=gg, ncol=2, nrow=length(topVar)))
+print(ggpubr::ggarrange(plotlist=gg2, ncol=2, nrow=length(topVar)))
+print(ggpubr::ggarrange(plotlist=gg1, ncol=2, nrow=length(topVar)))
+print(ggpubr::ggarrange(plotlist=gg3, ncol=2, nrow=length(topVar)))
+dev.off()
+message("Done!\n")
+rm(gg,gg1,gg2,gg3,topVar,i)
+
+###################
+
+### MA plots & Vulcano plots ### ------------------------------------------------------
+message("Plotting MA and Vulcano plots ...")
+# MA FUN
+MAfun <- function(res, title="", topN=5, Symbol=T, LFcut= quantile(abs(res$log2FoldChange),Qt)){
+  
+  x = res
+  if(!any(colnames(x)=="baseMean" | colnames(x)=="log2FoldChange")){
+    x$mean.ProtAbund <- 2^(x$mean.ProtAbund)
+    colnames(x)[grep("mean.ProtAbund", colnames(x))] <- "baseMean"
+    colnames(x)[grep("log2FC", colnames(x))] <- "log2FoldChange"
+    datType = "prot"
+  } else {datType = "rna"}
+  
+  my_theme <- theme(plot.title = element_text(size = 10, face = 'plain'), #line = element_line(size = .1),
+                    axis.text = element_text(size = 10),
+                    axis.title = element_text(size = 10),
+                    legend.text = element_text(size = 10),
+                    text = element_text(size = 7, face = 'plain'))
+  
+  ma <- ggpubr::ggmaplot(x, fdr = .05, fc = 2^(LFcut), size = 1, top = topN, legend = "bottom",
+                         select.top.method = 'fc', # fc or padj
+                         palette = c("#B31B21", "#1465AC", "darkgray"),
+                         genenames = if(Symbol == F){NULL}else{as.vector(res$SYMBOL)},
+                         xlab = if(datType == "prot"){"Mean intensity"}else{bquote(~log[2]~ "(mean expression)")},
+                         #font.legend = "bold", font.main = "bold", font.label = c("bold", 11), label.rectangle = F
+                         ylab = bquote(~log[2]~ "(fold change)")) +
+    ggtitle(paste0(title)) + theme_bw() + theme(legend.position = "bottom")
+  
+  if(LFcut != 0){
+    ma <- ma +
+      geom_text(aes(x = max(log2(x$baseMean)*.99), y = LFcut*1.5, label = round( LFcut,2)), size = 3.5) + 
+      geom_text(aes(x = max(log2(x$baseMean)*.99), y =-LFcut*1.5, label = round(-LFcut,2)), size = 3.5)
+  }
+  return(ma + my_theme)
+}
+# Vulcano FUN
+VulcFun <- function(res, title="", topN=5, Symbol=T, LFcut= quantile(abs(res$log2FoldChange),Qt)){
+  if(LFcut == 0){LFcut = 0.0000001}
+  
+  if(Symbol == T){
+    select <- res[order(res$padj),"SYMBOL"]
+  }else{
+    select <- rownames(res[order(res$padj),])
+  }
+  
+  my_theme <- theme(plot.title = element_text(size = 10, face = 'plain'), line = element_line(size = .6),
+                    axis.text = element_text(size = 10),
+                    axis.title = element_text(size = 10),
+                    legend.text = element_text(size = 8),
+                    text = element_text(size = 8, face = 'plain'))
+  
+  vu <- EnhancedVolcano::EnhancedVolcano(res, x = "log2FoldChange", y = "padj",
+                                         title = paste0(title," [LFcut:",round(LFcut,2),"]"), subtitle = NULL,
+                                         lab = if(Symbol == F){rownames(res)}else{res$SYMBOL},
+                                         selectLab = if(topN == 0){select[NULL]}else{select[1:topN]}, # select topgenes based on padj value
+                                         legendLabels = c('NS','Log2 FC','padj','padj & Log2 FC'),
+                                         xlab = bquote(~log[2]~ "(fold change)"), ylab = bquote(~-log[10]~"("~italic(padj)~")"),
+                                         FCcutoff = LFcut,   #default 1
+                                         pCutoff = .05,      #default 10e-6
+                                         labSize = 3.0,
+                                         pointSize = 1, #default 0.8
+                                         col = c("grey30", "grey30", "royalblue", "red2"),
+                                         #shape = c(1, 0, 17, 19),   #default 19, http://sape.inf.usi.ch/quick-reference/ggplot2/shape for details
+                                         colAlpha = 0.4, #default 0.5
+                                         hline = c(0.01, 0.001), hlineCol = c('grey40','grey55'), hlineType = 'dotted', hlineWidth = 0.6,
+                                         gridlines.major = T, gridlines.minor = T, drawConnectors = F,
+                                         #widthConnectors = 0.2, colConnectors = 'grey15'
+  ) + xlim(-max(abs(res$log2FoldChange))*1.05, max(abs(res$log2FoldChange)*1.05)) +
+    ylim(0, max(-log10(res$padj))*1.05) + theme_bw() + theme(legend.position = "bottom")
+  
+  return(vu + my_theme)
+  
+}
+
+# plot
+ggMA <- list()
+ggVU <- list()
+while (!is.null(dev.list()))  dev.off()
+#pdf(file = paste0("Plots/",substance,"_MAplots_Vulcano.pdf"), width = 5*length(res.ls), height = 10)
+
+# res - non-shrunk
+for(k in names(res.ls)){
+  ggMA[[k]] <- MAfun(res.ls[[k]], title = paste(substance,k))
+  ggVU[[k]] <- VulcFun(res.ls[[k]], title = paste(substance,k))
+}
+message("Printing non-shrunk results to png ...")
+png(file = paste0("Plots/",substance,"_MAplots_Vulcano.png"),
+    width = 8.5*length(res.ls), height = 20, units = "cm", res = 350)
+print(ggpubr::ggarrange(plotlist = c(ggMA,ggVU),ncol = length(res.ls), nrow =2))
+dev.off()
+
+# resLfs - lfc shrunk
+stopifnot(all(names(res.ls) == names(resLfs.ls)))
+for(k in names(resLfs.ls)){
+  ggMA[[k]] <- MAfun(resLfs.ls[[k]], title = paste(substance,k),
+                     LFcut = quantile(abs(res.ls[[k]]$log2FoldChange),Qt))
+  ggVU[[k]] <- VulcFun(resLfs.ls[[k]], title = paste(substance,k),
+                       LFcut = quantile(abs(res.ls[[k]]$log2FoldChange),Qt))
+}
+message("Printing apeglm shrunk results to png ...")
+png(file = paste0("Plots/",substance,"_MAplots_Vulcano.lfs.png"),
+    width = 8.5*length(resLfs.ls), height = 20, units = "cm", res = 350)
+print(ggpubr::ggarrange(plotlist = c(ggMA,ggVU),ncol = length(res.ls), nrow =2))
+dev.off()
+
+rm(ggMA, ggVU, k)
+message("Done!\n")
+################################
+
+### Diff.Expr. Protein Correlation ### -----------------------------------------
+DE.Cor.Venn = function(df.x, df.y, pcut = .05, typ.x = "DEG in HE", typ.y = "DEG in LE", title = "",
+                       LFcut.x = quantile(abs(df.x$log2FC),Qt),
+                       LFcut.y = quantile(abs(df.y$log2FC),Qt),
+                       COL = c("red3","deepskyblue1","blue4"),
+                       lfsSelect = F, lfsSet.x = NULL, lfsSet.y = NULL){
+  # subset df.x/.y for plotting based on pcut and LFcut settings
+  x = droplevels(subset(df.x[df.x$padj <= pcut, ], abs(log2FC) >= LFcut.x))[,"Gene"]
+  y = droplevels(subset(df.y[df.y$padj <= pcut, ], abs(log2FC) >= LFcut.y))[,"Gene"]
+  
+  # Provide custom gene set selection based on lfs cut
+  if(lfsSelect == T){
+    message("LF shrunk DEG selection provided")
+    x = lfsSet.x
+    y = lfsSet.y
+  }
+  
+  ## PLOT ONLY IF x & y contains data!!!
+  if( length(x) + length(y) > 0){
+    
+    # get common DEGs
+    ls = list(DEG.x = unique(x), DEG.y = unique(y))
+    names(ls) <- c(typ.x, typ.y)
+    int = intersect(ls[[1]], ls[[2]])
+    uni = union(ls[[1]], ls[[2]]) # union set of x & y
+    
+    # write df for gg corrplot
+    X = droplevels(df.x[df.x$Gene %in% uni,c("Gene","SYMBOL","log2FC")])
+    Y = droplevels(df.y[df.y$Gene %in% uni,c("Gene","SYMBOL","log2FC")])
+    stopifnot(nrow(X) == nrow(Y))
+    df = merge(X,Y, by = "Gene")[,-4]
+    
+    # append Type info to df
+    df[df$Gene %in% ls[[1]], "Type"] <- typ.x
+    df[df$Gene %in% ls[[2]], "Type"] <- typ.y
+    df[df$Gene %in% int, "Type"] <- "DEG Overlap"
+    df$Type <- factor(df$Type, levels = c("DEG Overlap", typ.y, typ.x))
+    
+    col = setNames(COL,c("DEG Overlap", typ.y, typ.x))
+    gg = list()
+    
+    ## Venn plot ##
+    venn = eulerr::euler(ls[c(2,1)], shape = "ellipse")
+    s = round(venn$stress,3)
+    e = round(venn$diagError,3)
+    tmp = sort(unlist(lapply(ls, length)))
+    pct = round(length(int)/tmp[1]*100,1)
+    gg[["VE"]] = plot(venn,
+                      fills = list(fill = col[c(2,3,1)], alpha = .6), #labels = list(col = "black", font = 4),
+                      legend = list(col = "black", font = 4),
+                      main = paste0("Stress: ",s,"\nDiag.Er: ",e,"\nShared ",pct,"%"), #main = paste0(fn,": sign. terms [padj < ",pcut,"]"),
+                      quantities = TRUE, shape = "ellipse", lty = 0)
+    
+    ## Corr plot ##
+    # cor test
+    cdf <- df[which(df$Type %in% 'DEG Overlap'),]
+    if(nrow(cdf) > 2){
+      res <- cor.test(cdf$log2FC.x, cdf$log2FC.y, method = "pearson", alternative = "greater")
+      p <- signif(res$p.value, digits = 2)
+      t <- round(res$statistic,1)
+      d <- round(res$parameter,1)
+      c <- round(res$estimate,2)
+      if(p <= .001) {i = "***"
+      }else if(p <= .01) {i = "**"
+      }else if(p <= .05) {i = "*"
+      }else {i = "NS"}
+    } else {
+      warning("Not enough common observations between HE & LE to run cor.test!\n")
+      c <- round(cor(cdf$log2FC.x, cdf$log2FC.y, method = "pearson"),2)
+      p <- t <- d <- i <- "NA"
+    }
+    cA <- round(cor(df$log2FC.x,df$log2FC.y),2)
+    
+    my_theme <- theme(axis.text = element_text(size = 12),
+                      axis.title = element_text(size = 13))
+    # cor plot
+    gg[["COR"]] = ggplot(df, aes(x=log2FC.x, y=log2FC.y, color = Type)) +
+      geom_point(size = 3, alpha = .4, shape = 16) +
+      geom_point(data = df[which(df$Type %in% 'DEG Overlap'),], #2nd layer
+                 aes(x=log2FC.x, y=log2FC.y), shape = 16, size = 3, alpha = .5) +
+      scale_color_manual(values = col) +
+      geom_hline(yintercept = 0, linetype = "dashed", alpha = .4) +
+      geom_vline(xintercept = 0, linetype = "dashed", alpha = .4) +
+      theme_bw() + theme(legend.position = 'bottom') + geom_rug(alpha = .5) +
+      labs(title = paste(substance,"- DEG cor:",title), 
+           subtitle = paste0(typ.x," vs ", typ.y,": (t=",t," df=",d," p=",p,")",i), 
+           x = paste0("Log2FC (",typ.x,")"), 
+           y = paste0("Log2FC (",typ.y,")")) +
+      annotate("text", label = paste0("Pearson Cor = ",c,"\nR2 = ",round(c^2,2)),
+               color = COL[1],
+               x = (min(df$log2FC.x)), 
+               y = (max(df$log2FC.y)),
+               hjust=0, vjust=.52) + 
+      annotate("text", label = paste0("Pearson Cor = ",cA,"\nR2 = ",round(cA^2,2)),
+               x = (max(df$log2FC.x)), 
+               y = (min(df$log2FC.y)),
+               hjust=.9, vjust=0) + my_theme
+    
+    return(gg)
+  } else { NULL }
+}
+
+# Add a gene column & replace 'log2FoldChange' with 'log2FC'; to fitt upper function
+mod_res <- function(res.ls){
+  RES <- lapply(res.ls, function(res){
+    x = res
+    x$Gene <- row.names(x)
+    colnames(x)[grep("log2FoldChange", colnames(x))] <- "log2FC"
+    return(x)
+  })
+  return(RES)
+}
+
+## Run the next lines only when more than one condition is present!!!! ##
+if(length(condition) > 2){
+  message("\nStart shiny DEG Correlation & Venn plotting ...")
+  
+  gg <- list() #to store plots in
+  RES = mod_res(res.ls)
+  RESlfs = mod_res(resLfs.ls)
+  
+  # No LFcut
+  for(k in names(RES)[-length(RES)]){
+    #n.x = gsub("[.].+$","", tail(names(RES),1))
+    #n.y = gsub("[.].+$","", k)
+    n.x = tail(names(RES),1)
+    n.y = k
+    message(paste("Plotting\t", n.y, "vs", n.x))
+    tmp = DE.Cor.Venn(RES[[length(RES)]], RES[[k]], LFcut.x=0, LFcut.y=0, title = paste0("padj<",p),
+                      typ.x = n.x, typ.y = n.y)
+    gg[[paste0(n.y,".VE")]]  <- tmp$VE
+    gg[[paste0(n.y,".COR")]] <- tmp$COR
+  }
+  
+  # LFcut
+  for(k in names(RES)[-length(RES)]){
+    #n.x = gsub("[.].+$","", tail(names(RES),1))
+    #n.y = gsub("[.].+$","", k)
+    n.x = tail(names(RES),1)
+    n.y = k
+    message(paste("Plotting\t", n.y, "vs", n.x))
+    tmp = DE.Cor.Venn(RES[[length(RES)]], RES[[k]], title = paste0("padj<",p," & LFcut (",(1-Qt)*100,"%Q)"),
+                      typ.x = n.x, typ.y = n.y)
+    gg[[paste0(n.y,".VEcut")]]  <- tmp$VE
+    gg[[paste0(n.y,".CORcut")]] <- tmp$COR
+  }
+  
+  # LFcut on apeglm shrunk lfc values
+  for(k in names(RES)[-length(RES)]){
+    #n.x = gsub("[.].+$","", tail(names(RES),1))
+    #n.y = gsub("[.].+$","", k)
+    n.x = tail(names(RES),1)
+    n.y = k
+    message(paste("Plotting\t", n.y, "vs", n.x))
+    LFcut.x = quantile(abs(RES[[length(RES)]]$log2FC),Qt)
+    LFcut.y = quantile(abs(RES[[k]]$log2FC),Qt)
+    X = RESlfs[[length(RESlfs)]]
+    Y = RESlfs[[k]]
+    s.x = droplevels(subset(X[X$padj <= p, ], abs(log2FC) >= LFcut.x))[,"Gene"]
+    s.y = droplevels(subset(Y[Y$padj <= p, ], abs(log2FC) >= LFcut.y))[,"Gene"]
+    tmp = DE.Cor.Venn(RES[[length(RES)]], RES[[k]], title = paste0("padj<",p," & LFcut (",(1-Qt)*100,"%Q) on lfs"),
+                      LFcut.x = LFcut.x, LFcut.y = LFcut.y,
+                      typ.x = n.x, typ.y = n.y, lfsSelect = T,
+                      lfsSet.x = s.x, lfsSet.y = s.y)
+    gg[[paste0(n.y,".VEcut.LFS")]]  <- tmp$VE
+    gg[[paste0(n.y,".CORcut.LFS")]] <- tmp$COR
+  }
+  
+  # LFcut on apeglm shrunk lfc values with shrunk lfc
+  for(k in names(RES)[-length(RES)]){
+    #n.x = gsub("[.].+$","", tail(names(RES),1))
+    #n.y = gsub("[.].+$","", k)
+    n.x = tail(names(RES),1)
+    n.y = k
+    message(paste("Plotting\t", n.y, "vs", n.x))
+    tmp = DE.Cor.Venn(RESlfs[[length(RESlfs)]], RESlfs[[k]], title = paste("padj <",p,"with lfs values"),
+                      LFcut.x = 0, LFcut.y = 0,
+                      typ.x = n.x, typ.y = n.y)
+    gg[[paste0(n.y,".VEcut.LFS2")]]  <- tmp$VE
+    gg[[paste0(n.y,".CORcut.LFS2")]] <- tmp$COR
+  }
+  
+  if(length(gg) > 0){
+    while (!is.null(dev.list()))  dev.off()
+    pdf(file = paste0("Plots/",substance,"_DEG_CorrVenn.pdf"),
+        width = 12, height = 6.1*(length(res.ls)-1) )
+    print( ggpubr::ggarrange(plotlist = gg, ncol = 2, nrow = length(res.ls)-1) )
+    dev.off()
+    message("Done!\n")
+    rm(RES,RESlfs,tmp,gg,k,n.x,n.y,LFcut.x,LFcut.y,X,Y,s.x,s.y)
+    gc()
+  } else {
+    message("No DEG correlation plot was plotted as no DEGs were found!\n")
+  }
+}
+######################################
+
+### Multi Venn Plot ### --------------------------------------------------------
+myVenn <- function(deg, title = "", shape = "ellipse", ...) {
+  # Venn fun
+  set.seed(42)
+  venn <- eulerr::euler(deg, shape = shape, ...)
+  s <- round(venn$stress,3)
+  e <- round(venn$diagError,3)
+  
+  # plot
+  return(
+    plot(venn,
+         fills = list(fill = ann_colors$Condition[-1], alpha = .6),
+         legend = list(col = "black", font = 4),
+         main = paste0(title,"\nStress: ",s," - Diag.Er: ",e),
+         quantities = TRUE, shape = shape, lty = 0)
+  )
+}
+
+if(length(condition) > 2){
+  if(length(condition)-1 > 6){
+    warning("Dataset contains ",length(condition)-1," treatment conditions.\n",
+            "Multi venn diagrams can only be drawn for a maximum of 6 treatments.\nSkipping multi venn plotting.")
+  } else {
+    message("Multi Venn plotting ...")
+    # use deg.ls ; degCut.ls & degLfs.ls as input
+    while (!is.null(dev.list()))  dev.off()
+    pdf(file = paste0("Plots/",substance,"_VennPlots.pdf"),
+        width = 13, height = 11)
+    par(mfrow = c(2,2))
+    gg <- list()
+    for(i in c("deg.ls","degCut.ls","degLfs.ls")){
+      deg <- lapply(get(i), row.names)
+      if(i == "deg.ls"){n = paste0("padj<",p)}
+      if(i == "degCut.ls"){n = paste0("padj<",p," & LFcut(",(1-Qt)*100,"% Qt)")}
+      if(i == "degLfs.ls"){n = paste0("padj<",p," & LFcut(",(1-Qt)*100,"% Qt) on lfs")}
+      # Venn1
+      venn::venn(deg, ilab=TRUE, zcolor = ann_colors$Condition[-1], lty = 0, 
+                 ilcs = 1, sncs = 1, box = F)
+      text(0,1000, labels = paste(substance,"DEGs [",n,"]"), pos = 4)
+      # Venn 2
+      gg[[i]] = myVenn(deg, paste(substance,"DEGs\n",n))
+    }
+    print(ggpubr::ggarrange(plotlist = gg, ncol = 2, nrow = 2))
+    dev.off()
+    rm(i,n, gg, deg)
+  }
+  message("Done!\n")
+}
+#######################
+
+### Session Information & save Rdata  ### --------------------------------------
+sink(paste0(home,"/DESeq2_SessionInfo.txt"))
 print(date())
 print(devtools::session_info())
-#print(xfun::session_info()) #use this instead when devtools breaks again ... 
 sink()
-
-# get back up to initial repo where analysis startet!
+message("Saving RData object. This might take a while ...")
+save.image(paste0(home,"/DESeq2_pairwise.RData"))
+message(paste0("\n\nFinished Wald's pairwise testing DESeq2's DEG analysis & data plotting.",
+               "\nAll outputs were saved in:\n",home,
+               "\n\nWhat a ride! Finally END of SCRIPT! :)\nJ.A.R.V.I.S. over and out\n"))
 setwd("../")
-
-message(" 
- Puh! What a ride! Finally END of SCRIPT :)
- ")
-# Finally clear out memory (Helpful if you run this script in a loop to free some memory)
-#rm(list = ls(all.names = TRUE)) #will clear all objects and hidden objects.
-
-########### END OF SCRIPT ############
+gc()
+###    END OF SCRIPT   ####
